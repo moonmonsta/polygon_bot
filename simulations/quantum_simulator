@@ -1,0 +1,38 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+def generate_3d_strategy():
+    # Create 3D grid
+    x = np.linspace(0, 1e6, 100)  # Liquidity depth
+    y = np.linspace(0.01, 0.1, 100)  # Price disparity
+    X, Y = np.meshgrid(x, y)
+    
+    # Simulated profit function
+    Z = np.sin(X/1e5) * np.cos(Y*10) * 1000  # Profit in basis points
+    
+    # Find optimal point
+    max_index = np.argmax(Z)
+    optimal_x = X.flatten()[max_index]
+    optimal_y = Y.flatten()[max_index]
+    optimal_z = Z.flatten()[max_index]
+    
+    # Plot
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot_surface(X, Y, Z, cmap='viridis')
+    ax.set_xlabel('Liquidity Depth')
+    ax.set_ylabel('Price Disparity')
+    ax.set_zlabel('Projected Profit (bps)')
+    plt.savefig('strategy_3d.png')
+    
+    return {
+        'optimal_amount': optimal_x,
+        'min_profit': optimal_z,
+        'price_disparity': optimal_y
+    }
+
+if __name__ == "__main__":
+    strategy = generate_3d_strategy()
+    print(f"Optimal Amount: {strategy['optimal_amount']:.2f}")
+    print(f"Minimum Profit: {strategy['min_profit']:.2f} bps")
