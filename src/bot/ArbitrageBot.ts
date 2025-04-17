@@ -1,505 +1,1049 @@
-import { ethers } from "ethers";
-import fetch from "node-fetch";
+// src/bot/ArbitrageBot.ts
+
+import { ethers, formatUnits, parseUnits } from "ethers"s";
 import { StackIntegrator } from '../stacks/StackIntegrator';
+import { PriceOracle } from '../utils/PriceOracle';
+import { DEXQuotes, ArbitrageStrategy, TokenPair } from '../types/ArbitrageTypes';
 import { logger } from '../utils/Logger';
+import { config } from '../config/Config';
+import { MulticallProvider } from '../utils/MulticallProvider';
+import { TokenService } from '../services/TokenService';
+import { DEXService } from '../services/DEXService';
+import { PerformanceMetrics } from '../utils/PerformanceMetrics';
+import { EventEmitter } from 'events';
+import { ArbitrageCoreABI } from '../abis/ArbitrageCoreABI';
+import { RouterABI } from '../abis/RouterABI';
+import { IERC20ABI } from '../abis/IERC20ABI';
 
-const ROUTER_ABI = require('../../abis/RouterABI.json');
-const QUICKSWAP_ROUTER = '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff';
-const SUSHISWAP_ROUTER = '0x1b02da8cb0d097eb8d57a175b88c7d8b47997506';
-const UNISWAP_V3_QUOTER = '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6';
+/**
+ * Event types for ArbitrageBot
+ */
+interface ArbitrageBotEvents {
+  started: void;
+  stopped: void;
+  error: {operation: string, error: unknown};
+}
 
-// Extended token addresses on Polygon
-const TOKEN_ADDRESSES = {
-  // Stablecoins
-  USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
-  USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
-  DAI: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063',
-  FRAX: '0x45c32fA6DF82ead1e2EF74d17b76547EDdFaFF89',
-  BUSD: '0xdAb529f40E671A1D4bF91361c21bf9f0C9712ab7',
-  TUSD: '0x2e1AD108fF1D8C782fcBbB89AAd783aC49586756',
-  MAI: '0xa3Fa99A148fA48D14Ed51d610c367C61876997F1',
-  
-  // Major tokens
-  WMATIC: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270',
-  WETH: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619',
-  WBTC: '0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6',
-  WAVAX: '0x2C89bbc92BD86F8075d1DEcc58C7F4E0107f286b',
-  WSOL: '0x7DfF46370e9eA5f0Bad3C4E29711aD50062EA7A4',
-  
-  // DeFi tokens
-  QUICK: '0xB5C064F955D8e7F38fE0460C556a72987494eE17',
-  SUSHI: '0x0b3F868E0BE5597D5DB7fEB59E1CADBb0fdDa50a',
-  AAVE: '0xD6DF932A45C0f255f85145f286eA0b292B21C90B',
-  BAL: '0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3',
-  CRV: '0x172370d5Cd63279eFa6d502DAB29171933a610AF',
-  LINK: '0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39',
-  UNI: '0xb33EaAd8d922B1083446DC23f610c2567fB5180f',
-  SNX: '0x50B728D8D964fd00C2d0AAD81718b71311feF68a',
-  AXL: '0x6e4e624106cb12e168e6533f8ec7c82263358940',
-  COMP: '0x8505b9d2254A7Ae468c0E9dd10Ccea3A837aef5c',
-
-  // NFT/Gaming tokens
-  SAND: '0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683',
-  MANA: '0xA1c57f48F0Deb89f569dFbE6E2B7f46D33606fD4',
-  AXS: '0x61BDD9C7d4dF4Bf47A4508c0c8245505F2Af5b7b',
-  ENJ: '0x7eC26842F195c852Fa843bB9f6D8B583a274a157',
-  GHST: '0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7',
-  
-  // Additional tokens on Polygon
-  RNDR: '0x61299774020dA444Af134c82fa83E3810b309991',
-  GRT: '0x5fe2B58c013d7601147DcdD68C143A77499f5531',
-  LDO: '0xC3C7d422809852031b44ab29EEC9F1EfF2A58756',
-  RPL: '0x7205705771547cF79201111B4761134BD6Deb1dd',
-  MKR: '0x6f7C932e7684666C9fd1d44527765433e01fF61d',
-  FXS: '0x1a3acf6D19267E2d3e7f898f42803e90C9219062',
-  CVX: '0x4257EA7637c355F81616050CbB6a9b709c0f2006',
-  DYDX: '0x4c3bF0a3DE9524aF68327d1D2558a3B70d17D42a',
+/**
+ * Type for EventEmitter with strongly-typed events
+ */
+type TypedEventEmitter<T> = Omit<EventEmitter, "on" | "emit"> & {
+  on<K extends keyof T>(event: K, listener: (arg: T[K]) => void): this;
+  emit<K extends keyof T>(event: K, arg: T[K]): boolean;
 };
 
-export class ArbitrageBot {
-  private stackIntegrator = new StackIntegrator();
-  private provider: ethers.JsonRpcProvider;
+/**
+ * Enhanced ArbitrageBot with quantum-inspired optimization
+ * Core component for flash loan arbitrage detection and execution on Polygon
+ */
+export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<ArbitrageBotEvents> {
+  // Stacks and services
+  private stackIntegrator: StackIntegrator;
+  private priceOracle: PriceOracle;
+  private tokenService: TokenService;
+  private dexService: DEXService;
+  private metrics: PerformanceMetrics;
+
+  // Blockchain connectivity
+  private provider: ethers.providers.Provider;
+  private multicallProvider: MulticallProvider;
   private wallet: ethers.Wallet;
-  private quickswap: ethers.Contract;
-  private sushiswap: ethers.Contract;
-  
-  // Configuration for cycle limits and performance
-  private config = {
-    maxCycles: 2000,        // Increased maximum cycles
-    maxTokensToConsider: 40, // Increased token consideration
-    maxPairsToUse: 400,     // Increased pairs to consider
-    cycleLengths: [3, 4],   // Try both 3-token and 4-token cycles
-    progressInterval: 50,   // Log progress every 50 cycles
-    testAmounts: [          // Test multiple amounts
-      ethers.parseUnits('10', 18),
-      ethers.parseUnits('100', 18),
-      ethers.parseUnits('1000', 18)
-    ],
-    minProfitPercentage: 0.05 // 0.05% minimum profit to consider
-  };
-  
+  private flashLoanContract: ethers.Contract;
+
+  // Runtime state
+  private isRunning: boolean = false;
+  private cycleDetectionRunning: boolean = false;
+  private executionInProgress: boolean = false;
+  private lastDetectionTime: number = 0;
+  private detectionInterval: NodeJS.Timeout | null = null;
+  private blockSubscription: any = null;
+
+  // Performance optimization
+  private opportunityCache: Map<string, any> = new Map();
+  private pathCache: Map<string, { timestamp: number; paths: string[][] }> = new Map();
+  private pairScores: Map<string, number> = new Map();
+  private cacheValidityPeriod = 30 * 1000; // 30 seconds
+
+  // Configuration
+  private readonly parallelismFactor = 3;
+  private readonly maxConcurrentOperations = 5;
+  private readonly minTimeBetweenDetections = 5000; // 5 seconds
+  private activeOperations = 0;
+
   constructor(
-    private flashLoanAddress: string,
-    private privateKey: string,
-    private rpcUrl: string
+    private readonly flashLoanAddress: string,
+    private readonly privateKey: string,
+    private readonly rpcUrl: string,
+    private readonly wsRpcUrl?: string,
+    private options: {
+      keystoneActivation?: boolean;
+      tiDominantWeight?: number;
+      neDominantWeight?: number;
+      entropy?: number;
+      adaptiveBatchSize?: boolean;
+      blockSubscription?: boolean;
+    } = {}
   ) {
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    super();
+
+    // Apply defaults
+    this.options = {
+      keystoneActivation: true,
+      tiDominantWeight: 0.85,
+      neDominantWeight: 0.72,
+      entropy: 0.96,
+      adaptiveBatchSize: true,
+      blockSubscription: !!wsRpcUrl,
+      ...options
+    };
+
+    // Initialize connections
+    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
     this.wallet = new ethers.Wallet(this.privateKey, this.provider);
-    this.quickswap = new ethers.Contract(QUICKSWAP_ROUTER, ROUTER_ABI, this.wallet);
-    this.sushiswap = new ethers.Contract(SUSHISWAP_ROUTER, ROUTER_ABI, this.wallet);
+    this.multicallProvider = new MulticallProvider(this.provider);
+
+    // Initialize contracts
+    this.flashLoanContract = new ethers.Contract(
+      this.flashLoanAddress,
+      ArbitrageCoreABI,
+      this.wallet
+    );
+
+    // Initialize core services
+    this.tokenService = new TokenService(this.multicallProvider);
+    this.dexService = new DEXService(this.multicallProvider, config);
+    this.priceOracle = new PriceOracle();
+    this.metrics = new PerformanceMetrics();
+
+    // Initialize quantum stack integration
+    this.stackIntegrator = new StackIntegrator({
+      keystoneActivation: this.options.keystoneActivation,
+      tiDominantWeight: this.options.tiDominantWeight,
+      neDominantWeight: this.options.neDominantWeight,
+      entropy: this.options.entropy
+    });
+
+    logger.info('ArbitrageBot initialized with quantum-enhanced parameters');
   }
 
-  async start() {
+  /**
+   * Start the arbitrage bot with continuous monitoring
+   */
+  public async start(): Promise<void> {
+    if (this.isRunning) {
+      logger.warn('ArbitrageBot is already running');
+      return;
+    }
+
     try {
-      // Generate predefined pairs
-      const pairs = this.generatePredefinedPairs();
-      logger.info(`Using ${pairs.length} predefined pairs for arbitrage opportunities`);
-
-      // Extract unique tokens from pairs
-      const allTokens = Array.from(new Set(pairs.flatMap(p => [p.baseToken.address, p.quoteToken.address])));
-      // Prioritize the most important tokens but include more
-      const tokens = allTokens.slice(0, this.config.maxTokensToConsider);
-      logger.info(`Found ${tokens.length} unique tokens to consider`);
-
-      // Try different cycle lengths
-      let allCycleQuotes: any[] = [];
+      this.isRunning = true;
+      // Initialize services
+      await this.initializeServices();
       
-      for (const cycleLength of this.config.cycleLengths) {
-        // Generate potential arbitrage cycles for this length
-        logger.info(`Generating cycles of length ${cycleLength}...`);
-        const cycles = this.generateCycles(tokens, cycleLength);
-        
-        // Limit the number of cycles to check
-        const limitedCycles = cycles.slice(0, this.config.maxCycles);
-        logger.info(`Checking ${limitedCycles.length} potential arbitrage paths of length ${cycleLength}`);
-
-        // Process in parallel batches for better performance
-        const batchSize = 20;
-        const cycleQuotes: any[] = [];
-        let processedCycles = 0;
-        
-        for (let i = 0; i < limitedCycles.length; i += batchSize) {
-          const batch = limitedCycles.slice(i, i + batchSize);
-          const batchPromises = batch.map(cycle => this.getCycleQuotes(cycle));
-          const batchResults = await Promise.all(batchPromises);
-          
-          for (const quotes of batchResults) {
-            if (quotes.length && quotes.every(q => q && q.profit > 0)) {
-              // Calculate profit percentage
-              const totalInput = quotes[0].amountIn;
-              const totalProfit = quotes.reduce((acc, q) => acc + q.profit, 0);
-              const profitPercentage = (totalProfit / totalInput) * 100;
-              
-              // Only add if profit percentage is above threshold
-              if (profitPercentage >= this.config.minProfitPercentage) {
-                quotes[0].profitPercentage = profitPercentage;
-                cycleQuotes.push(quotes);
-              }
-            }
-          }
-          
-          processedCycles += batch.length;
-          if (processedCycles % this.config.progressInterval === 0 || processedCycles === limitedCycles.length) {
-            logger.info(`Processed ${processedCycles}/${limitedCycles.length} cycles of length ${cycleLength}`);
-          }
-        }
-        
-        logger.info(`Found ${cycleQuotes.length} potentially profitable cycles of length ${cycleLength}`);
-        allCycleQuotes = allCycleQuotes.concat(cycleQuotes);
+      // Setup monitoring method based on configuration
+      if (this.options.blockSubscription && this.wsRpcUrl) {
+        await this.setupBlockSubscription();
+      } else {
+        this.setupIntervalDetection();
       }
 
-      if (allCycleQuotes.length === 0) {
-        logger.info('No profitable arbitrage opportunities found this round');
-        return;
-      }
-      
-      // Sort by profit percentage
-      allCycleQuotes.sort((a, b) => b[0].profitPercentage - a[0].profitPercentage);
-      
-      // Log top opportunities
-      logger.info(`Top opportunities:`);
-      for (let i = 0; i < Math.min(3, allCycleQuotes.length); i++) {
-        const opportunity = allCycleQuotes[i];
-        logger.info(`  ${i+1}. Profit: ${opportunity[0].profitPercentage.toFixed(4)}% - Path: ${this.formatPath(opportunity)}`);
-      }
+      logger.info('ArbitrageBot is running');
+      this.emit('started');
+    } catch (error) {
+      this.isRunning = false;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to start ArbitrageBot: ${errorMessage}`);
+      this.emit('error', {operation: 'start', error});
+      throw error;
+    }
+  }
 
-      // Evaluate best arbitrage opportunity
-      const allQuotes = allCycleQuotes.flat();
-      const best = this.stackIntegrator.evaluate(allQuotes, allCycleQuotes);
+  /**
+   * Stop the arbitrage bot
+   */
+  public stop(): void {
+    if (!this.isRunning) {
+      logger.warn('ArbitrageBot is not running');
+      return;
+    }
 
-      if (best) {
-        logger.info(`Executing arbitrage: ${best.pair} with projected profit ${best.projectedProfit}`);
+    // Clear interval if using polling
+    if (this.detectionInterval) {
+      clearInterval(this.detectionInterval);
+      this.detectionInterval = null;
+    }
+
+    // Unsubscribe from block events if using websocket
+    if (this.blockSubscription) {
+      this.blockSubscription.removeAllListeners();
+      this.blockSubscription = null;
+    }
+
+    this.isRunning = false;
+    logger.info('ArbitrageBot stopped');
+    this.emit('stopped');
+  }
+
+  /**
+   * Initialize required services before starting
+   */
+  private async initializeServices(): Promise<void> {
+    // Initialize tokens with parallel loading
+    const tokensPromise = this.tokenService.loadTokens(config.TOKENS);
+    // Initialize DEX routers with parallel loading
+    const dexPromise = this.dexService.initializeDEXs();
+    // Initialize price feeds
+    const pricePromise = this.priceOracle.initialize();
+    
+    // Wait for all initializations to complete
+    await Promise.all([tokensPromise, dexPromise, pricePromise]);
+    // Warm up token pair cache
+    await this.tokenService.preloadCommonPairs(config.TOKEN_PAIRS);
+    
+    logger.info('Services initialized successfully');
+  }
+
+  /**
+   * Setup websocket subscription for new blocks
+   */
+  private async setupBlockSubscription(): Promise<void> {
+    if (!this.wsRpcUrl) {
+      throw new Error('WebSocket RPC URL not provided');
+    }
+
+    try {
+      const wsProvider = new ethers.providers.WebSocketProvider(this.wsRpcUrl);
+      // Ensure connection is established
+      await wsProvider.ready;
+      
+      wsProvider.on('block', async (blockNumber) => {
+        if (this.shouldSkipDetection()) return;
         
-        // Execute the arbitrage trade
-        const flashLoanContract = new ethers.Contract(
-          this.flashLoanAddress,
-          [
-            'function executeArbitrage(address[] calldata path, uint amountIn) external',
-            'function withdraw() external'
-          ],
-          this.wallet
-        );
+        logger.debug(`New block detected: ${blockNumber}`);
+        this.lastDetectionTime = Date.now();
+        this.checkArbitrageOpportunities(blockNumber)
+          .catch(error => this.handleError('block detection', error));
+      });
+      
+      this.blockSubscription = wsProvider;
+      logger.info('Block subscription established');
+    } catch (error) {
+      logger.error(`Failed to setup WebSocket connection: ${error instanceof Error ? error.message : String(error)}`);
+      logger.info('Falling back to interval-based detection');
+      this.setupIntervalDetection();
+    }
+  }
+
+  /**
+   * Setup interval-based polling for arbitrage opportunities
+   */
+  private setupIntervalDetection(): void {
+    // Clear any existing interval
+    if (this.detectionInterval) {
+      clearInterval(this.detectionInterval);
+    }
+
+    // Create new interval with optimal polling frequency
+    this.detectionInterval = setInterval(async () => {
+      if (this.shouldSkipDetection()) return;
+      
+      this.lastDetectionTime = Date.now();
+      const blockNumber = await this.provider.getBlockNumber();
+      this.checkArbitrageOpportunities(blockNumber)
+        .catch(error => this.handleError('interval detection', error));
+    }, config.DETECTION_INTERVAL);
+    
+    logger.info(`Interval-based detection started with ${config.DETECTION_INTERVAL}ms frequency`);
+  }
+
+  /**
+   * Determines if arbitrage detection should be skipped
+   * (based on cooling period and active operations)
+   */
+  private shouldSkipDetection(): boolean {
+    if (this.cycleDetectionRunning) {
+      return true;
+    }
+
+    if (this.executionInProgress) {
+      return true;
+    }
+
+    const timeSinceLastDetection = Date.now() - this.lastDetectionTime;
+    if (timeSinceLastDetection < this.minTimeBetweenDetections) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Main function to check for arbitrage opportunities
+   * Uses quantum stack optimization for efficient path discovery
+   */
+  private async checkArbitrageOpportunities(blockNumber: number): Promise<void> {
+    if (this.cycleDetectionRunning) {
+      logger.debug('Arbitrage detection already in progress, skipping');
+      return;
+    }
+
+    try {
+      this.cycleDetectionRunning = true;
+      this.metrics.startOperation('opportunityDetection');
+      logger.info(`Checking arbitrage opportunities at block ${blockNumber}`);
+      
+      // Phase 1: Generate pairs and paths
+      const { pairs, tokens } = await this.generatePairsAndTokens();
+      
+      // Phase 2: Generate potential arbitrage cycles
+      const cycles = this.generateArbitrageCycles(tokens);
+      
+      // Phase 3: Evaluate cycles for profit potential
+      const opportunities = await this.evaluateCycles(cycles, pairs);
+      
+      // Phase 4: Execute profitable arbitrage if found
+      if (opportunities.length > 0) {
+        // Sort by profitability
+        opportunities.sort((a, b) => {
+          if (!a[0]?.profitPercentage || !b[0]?.profitPercentage) return 0;
+          return b[0].profitPercentage - a[0].profitPercentage;
+        });
         
-        // Extract path from best quote
-        const path = this.constructPathFromQuotes(best);
-        const amountIn = ethers.parseUnits((best.amountIn || 100).toString(), 18);
+        // Log top opportunities
+        this.logTopOpportunities(opportunities);
         
-        // Execute the transaction
-        const tx = await flashLoanContract.executeArbitrage(path, amountIn);
-        logger.info(`Transaction submitted: ${tx.hash}`);
+        // Find best opportunity using quantum stack integration
+        const allQuotes = opportunities.flatMap(group => group);
+        const best = this.stackIntegrator.evaluate(allQuotes, opportunities);
         
-        // Wait for transaction to be mined
-        const receipt = await tx.wait();
-        logger.info(`Transaction confirmed in block ${receipt.blockNumber}`);
-        
-        // Check if transaction was successful
-        if (receipt.status === 1) {
-          logger.info('Arbitrage executed successfully');
+        if (best) {
+          await this.executeArbitrage(best);
         } else {
-          logger.error('Arbitrage transaction failed');
+          logger.info('No quantum-approved arbitrage opportunity found');
         }
       } else {
-        logger.info('No stack-approved arbitrage found');
+        logger.info('No profitable arbitrage opportunities found');
       }
-    } catch (error: any) {
-      logger.error(`Error in arbitrage execution: ${error?.message || 'Unknown error'}`);
+
+      this.metrics.endOperation('opportunityDetection');
+      this.cycleDetectionRunning = false;
+    } catch (error) {
+      this.metrics.endOperation('opportunityDetection', false);
+      this.cycleDetectionRunning = false;
+      this.handleError('opportunity detection', error);
     }
   }
 
-  // Format a path for logging
-  formatPath(quotes: any[]): string {
-    if (!Array.isArray(quotes) || quotes.length === 0) return "Empty path";
-    
-    const path = [this.getTokenSymbol(quotes[0].from)];
-    for (const quote of quotes) {
-      path.push(this.getTokenSymbol(quote.to));
+  /**
+   * Generate pairs and tokens for analysis
+   * Uses adaptive selection based on historical performance
+   */
+  private async generatePairsAndTokens(): Promise<{
+    pairs: TokenPair[];
+    tokens: string[];
+  }> {
+    this.metrics.startOperation('pairGeneration');
+    try {
+      // Get predefined pairs with adaptive selection
+      const allPairs = await this.dexService.getTokenPairs();
+      
+      // Prioritize pairs based on historical performance
+      const prioritizedPairs = this.prioritizePairs(allPairs);
+      
+      // Limit to configured maximum
+      const pairs = prioritizedPairs.slice(0, config.MAX_PAIRS_TO_USE);
+      
+      // Extract unique tokens from pairs
+      const allTokens = Array.from(new Set(
+        pairs.flatMap(p => [
+          p.baseToken.toLowerCase(),
+          p.quoteToken.toLowerCase()
+        ])
+      ));
+      
+      // Prioritize tokens
+      const tokens = allTokens.slice(0, config.MAX_TOKENS_TO_CONSIDER);
+      
+      logger.info(`Generated ${pairs.length} pairs with ${tokens.length} unique tokens`);
+      this.metrics.endOperation('pairGeneration');
+      return { pairs, tokens };
+    } catch (error) {
+      this.metrics.endOperation('pairGeneration', false);
+      throw error;
     }
-    
-    return path.join(" → ");
-  }
-  
-  // Get token symbol from address
-  getTokenSymbol(address: string): string {
-    const addressLower = address.toLowerCase();
-    for (const [symbol, addr] of Object.entries(TOKEN_ADDRESSES)) {
-      if (addr.toLowerCase() === addressLower) {
-        return symbol;
-      }
-    }
-    return address.substring(0, 6) + "...";
   }
 
-  // Extract path from quotes
-  constructPathFromQuotes(bestQuote: any): string[] {
-    // If it's a cycle quote, construct the full path
-    if (Array.isArray(bestQuote) && bestQuote.length > 0) {
-      const path = [bestQuote[0].from];
-      for (const quote of bestQuote) {
-        path.push(quote.to);
-      }
-      return path;
-    }
-    
-    // If it's a single quote
-    return [bestQuote.from, bestQuote.to];
+  /**
+   * Prioritize pairs based on historical performance
+   * Uses quantum-inspired scoring for optimal selection
+   */
+  private prioritizePairs(pairs: TokenPair[]): TokenPair[] {
+    return pairs.sort((a, b) => {
+      const scoreA = this.getPairScore(a);
+      const scoreB = this.getPairScore(b);
+      return scoreB - scoreA;
+    });
   }
 
-  // Generate predefined pairs based on popular stablecoins and tokens
-  generatePredefinedPairs(): any[] {
-    const pairs: any[] = [];
-    
-    // Group tokens by category
-    const stablecoins = [
-      TOKEN_ADDRESSES.USDC, TOKEN_ADDRESSES.USDT, TOKEN_ADDRESSES.DAI, 
-      TOKEN_ADDRESSES.FRAX, TOKEN_ADDRESSES.BUSD, TOKEN_ADDRESSES.TUSD,
-      TOKEN_ADDRESSES.MAI
-    ];
-    
-    const majorTokens = [
-      TOKEN_ADDRESSES.WMATIC, TOKEN_ADDRESSES.WETH, TOKEN_ADDRESSES.WBTC,
-      TOKEN_ADDRESSES.WAVAX, TOKEN_ADDRESSES.WSOL
-    ];
-    
-    const defiTokens = [
-      TOKEN_ADDRESSES.QUICK, TOKEN_ADDRESSES.SUSHI, TOKEN_ADDRESSES.AAVE, 
-      TOKEN_ADDRESSES.BAL, TOKEN_ADDRESSES.CRV, TOKEN_ADDRESSES.LINK,
-      TOKEN_ADDRESSES.UNI, TOKEN_ADDRESSES.SNX, TOKEN_ADDRESSES.AXL,
-      TOKEN_ADDRESSES.COMP, TOKEN_ADDRESSES.MKR, TOKEN_ADDRESSES.LDO,
-      TOKEN_ADDRESSES.CVX, TOKEN_ADDRESSES.RPL, TOKEN_ADDRESSES.FXS
-    ];
-    
-    const nftGameTokens = [
-      TOKEN_ADDRESSES.SAND, TOKEN_ADDRESSES.MANA, TOKEN_ADDRESSES.AXS,
-      TOKEN_ADDRESSES.ENJ, TOKEN_ADDRESSES.GHST
-    ];
-    
-    const otherTokens = [
-      TOKEN_ADDRESSES.RNDR, TOKEN_ADDRESSES.GRT
-    ];
-    
-    // Generate all possible pairs between categories
-    
-    // Stablecoin pairs
-    for (let i = 0; i < stablecoins.length; i++) {
-      for (let j = i + 1; j < stablecoins.length; j++) {
-        pairs.push(this.createPairObject(stablecoins[i], stablecoins[j]));
-      }
+  /**
+   * Get score for a token pair based on historical performance
+   * Incorporates entropy-based value modulation
+   */
+  private getPairScore(pair: TokenPair): number {
+    const pairKey = `${pair.baseToken}-${pair.quoteToken}`;
+    // Get cached score or initialize
+    let score = this.pairScores.get(pairKey) || 0.5;
+    // Apply entropy-based score modulation
+    const entropyFactor = Math.sin(Date.now() / 10000) * 0.1 + 0.9;
+    score *= entropyFactor;
+    // Apply small random fluctuation for exploration
+    if (Math.random() < 0.1) {
+      score *= 0.8 + Math.random() * 0.4;
     }
-    
-    // Major tokens with stablecoins
-    for (const token of majorTokens) {
-      for (const stablecoin of stablecoins) {
-        pairs.push(this.createPairObject(token, stablecoin));
-      }
-    }
-    
-    // Major tokens with each other
-    for (let i = 0; i < majorTokens.length; i++) {
-      for (let j = i + 1; j < majorTokens.length; j++) {
-        pairs.push(this.createPairObject(majorTokens[i], majorTokens[j]));
-      }
-    }
-    
-    // DeFi tokens with stablecoins and major tokens
-    for (const defiToken of defiTokens) {
-      for (const stablecoin of stablecoins) {
-        pairs.push(this.createPairObject(defiToken, stablecoin));
-      }
-      
-      for (const majorToken of majorTokens) {
-        pairs.push(this.createPairObject(defiToken, majorToken));
-      }
-    }
-    
-    // NFT/Game tokens with stablecoins and major tokens
-    for (const nftToken of nftGameTokens) {
-      for (const stablecoin of stablecoins) {
-        pairs.push(this.createPairObject(nftToken, stablecoin));
-      }
-      
-      for (const majorToken of majorTokens) {
-        pairs.push(this.createPairObject(nftToken, majorToken));
-      }
-    }
-    
-    // Other tokens with stablecoins and major tokens
-    for (const otherToken of otherTokens) {
-      for (const stablecoin of stablecoins) {
-        pairs.push(this.createPairObject(otherToken, stablecoin));
-      }
-      
-      for (const majorToken of majorTokens) {
-        pairs.push(this.createPairObject(otherToken, majorToken));
-      }
-    }
-    
-    // Some DeFi tokens with each other (selected combinations)
-    const popularDefiPairs = [
-      [TOKEN_ADDRESSES.AAVE, TOKEN_ADDRESSES.SUSHI],
-      [TOKEN_ADDRESSES.AAVE, TOKEN_ADDRESSES.CRV],
-      [TOKEN_ADDRESSES.QUICK, TOKEN_ADDRESSES.SUSHI],
-      [TOKEN_ADDRESSES.LINK, TOKEN_ADDRESSES.UNI],
-      [TOKEN_ADDRESSES.BAL, TOKEN_ADDRESSES.AAVE],
-      [TOKEN_ADDRESSES.MKR, TOKEN_ADDRESSES.AAVE],
-      [TOKEN_ADDRESSES.CRV, TOKEN_ADDRESSES.CVX],
-      [TOKEN_ADDRESSES.LDO, TOKEN_ADDRESSES.RPL]
-    ];
-    
-    for (const [token1, token2] of popularDefiPairs) {
-      pairs.push(this.createPairObject(token1, token2));
-    }
-    
-    return pairs;
-  }
-  
-  // Create a pair object with base and quote tokens
-  createPairObject(address1: string, address2: string): any {
-    // Sort addresses to maintain consistency
-    const [baseAddress, quoteAddress] = [address1, address2].sort();
-    return {
-      baseToken: { address: baseAddress },
-      quoteToken: { address: quoteAddress }
-    };
-  }
-  
-  // Create a unique key for a pair
-  getPairKey(address1: string, address2: string): string {
-    const [addr1, addr2] = [address1.toLowerCase(), address2.toLowerCase()].sort();
-    return `${addr1}_${addr2}`;
+
+    return score;
   }
 
-  generateCycles(tokens: string[], cycleLength: number): string[][] {
-    const pairExists = new Map<string, boolean>();
-    const self = this; // Store reference to 'this' for use in inner function
-    
-    function permute(path: string[], used: boolean[], depth: number): string[][] {
-      // Base case: we've completed a cycle
-      if (path.length === cycleLength) {
-        if (path[0] === path[path.length - 1]) return [path.slice()];
-        return [];
+  /**
+   * Update score for a token pair based on detection results
+   */
+  private updatePairScore(pair: string, profitable: boolean, profitAmount?: number): void {
+    const currentScore = this.pairScores.get(pair) || 0.5;
+    // Calculate new score
+    let newScore: number;
+    if (profitable && profitAmount) {
+      // Successful arbitrage - increase score
+      newScore = currentScore * 0.8 + 0.2 * Math.min(1, profitAmount / 100);
+    } else if (profitable) {
+      // Profitable but not executed
+      newScore = currentScore * 0.9 + 0.1;
+    } else {
+      // Not profitable - gradually decrease score
+      newScore = currentScore * 0.95;
+    }
+
+    // Apply bounds
+    newScore = Math.max(0.1, Math.min(1.0, newScore));
+    // Update score
+    this.pairScores.set(pair, newScore);
+  }
+
+  /**
+   * Generate arbitrage cycles with quantum-inspired optimization
+   * Uses probabilistic exploration for efficient path discovery
+   */
+  private generateArbitrageCycles(tokens: string[]): string[][] {
+    this.metrics.startOperation('cycleGeneration');
+    try {
+      const cyclesByLength: Map<number, string[][]> = new Map();
+      // Check cache first
+      const cacheKey = tokens.slice(0, 20).join('-');
+      const cachedPaths = this.pathCache.get(cacheKey);
+      if (cachedPaths && (Date.now() - cachedPaths.timestamp) < this.cacheValidityPeriod) {
+        this.metrics.endOperation('cycleGeneration');
+        return cachedPaths.paths;
       }
-      
-      // Early termination: if we've generated enough cycles
-      if (depth > 3 && path.length < 2) {
-        return [];
-      }
-      
-      let res: string[][] = [];
-      for (let i = 0; i < tokens.length; i++) {
-        // Check if this is the last element completing the cycle
-        const isCompletingCycle = path.length + 1 === cycleLength && tokens[i] === path[0];
-        
-        // Skip if token already used (unless completing the cycle)
-        if (used[i] && !isCompletingCycle) continue;
-        
-        // If not the first token, check if the pair exists in our known pairs
-        if (path.length > 0) {
-          const lastToken = path[path.length - 1];
-          const pairKey = self.getPairKey(lastToken, tokens[i]);
-          
-          // Skip if we know this pair doesn't exist
-          if (pairExists.has(pairKey) && !pairExists.get(pairKey)) {
-            continue;
-          }
+
+      // Generate cycles for different cycle lengths
+      let allCycles: string[][] = [];
+      for (const cycleLength of config.CYCLE_LENGTHS) {
+        const cycles = this._generateCyclesOfLength(tokens, cycleLength);
+        // Store in map
+        cyclesByLength.set(cycleLength, cycles);
+        // Add to overall list with limit
+        allCycles = allCycles.concat(
+          cycles.slice(0, config.MAX_CYCLES_PER_LENGTH)
+        );
+        if (allCycles.length >= config.MAX_CYCLES) {
+          break;
         }
-        
-        used[i] = true;
-        path.push(tokens[i]);
-        res = res.concat(permute(path, used, depth + 1));
-        path.pop();
-        used[i] = false;
-        
-        // If we have enough cycles, stop early - increased limit
-        if (res.length > 1500) break;
       }
-      return res;
+
+      // Randomize a portion of results to encourage exploration
+      const explorationRatio = 0.1;
+      const explorationCount = Math.floor(allCycles.length * explorationRatio);
+      if (explorationCount > 0) {
+        const explorationIndices = new Set<number>();
+        while (explorationIndices.size < explorationCount) {
+          explorationIndices.add(Math.floor(Math.random() * allCycles.length));
+        }
+
+        // Replace selected indices with random cycles
+        for (const index of explorationIndices) {
+          const cycleLength = allCycles[index].length;
+          const randomCycle = this._generateRandomCycle(tokens, cycleLength);
+          allCycles[index] = randomCycle;
+        }
+      }
+
+      // Cache the results
+      this.pathCache.set(cacheKey, {
+        timestamp: Date.now(),
+        paths: allCycles
+      });
+      logger.info(`Generated ${allCycles.length} potential arbitrage cycles`);
+      this.metrics.endOperation('cycleGeneration');
+      return allCycles;
+    } catch (error) {
+      this.metrics.endOperation('cycleGeneration', false);
+      throw error;
     }
-    
-    let cycles: string[][] = [];
-    // Consider more starting tokens for more path diversity
-    const startTokens = Math.min(15, tokens.length);
-    for (let i = 0; i < startTokens; i++) {
-      const used = Array(tokens.length).fill(false);
-      used[i] = true;
-      const newCycles = permute([tokens[i]], used, 1);
-      cycles = cycles.concat(newCycles);
-      
-      // If we've already found enough cycles, stop - increased limit
-      if (cycles.length > 2000) break;
-    }
-    
-    return cycles;
   }
 
-  async getCycleQuotes(cycle: string[]): Promise<any[]> {
-    const quotes: any[] = [];
-    for (let i = 0; i < cycle.length - 1; i++) {
-      const from = cycle[i];
-      const to = cycle[i + 1];
-      
-      // Try multiple amounts
-      let bestQuote = null;
-      let highestProfit = -Infinity;
-      
-      for (const amountIn of this.config.testAmounts) {
-        try {
-          let out;
-          let router = "quickswap";
-          
-          try {
-            out = await this.quickswap.getAmountsOut(amountIn, [from, to]);
-          } catch (quickswapError) {
-            try {
-              out = await this.sushiswap.getAmountsOut(amountIn, [from, to]);
-              router = "sushiswap";
-            } catch (sushiswapError) {
-              // If both fail, skip this amount
-              continue;
-            }
+  /**
+   * Generate cycles of specific length
+   * Uses beam search with entropy-guided exploration
+   */
+  private _generateCyclesOfLength(tokens: string[], cycleLength: number): string[][] {
+    if (cycleLength < 3) return [];
+    // Setup beam search parameters
+    const beamWidth = 25 * cycleLength;
+    let beams: { path: string[]; score: number }[] = [{ path: [], score: 0 }];
+
+    // First token selection - prioritize stablecoins and major tokens
+    if (beams[0].path.length === 0) {
+      beams = [];
+      const stablecoins = tokens.filter(t =>
+        this.tokenService.isStablecoin(t) || this.tokenService.isMajorToken(t)
+      );
+      for (const token of stablecoins.length > 0 ? stablecoins : tokens.slice(0, 10)) {
+        beams.push({
+          path: [token],
+          score: this.tokenService.getTokenWeight(token)
+        });
+      }
+    }
+
+    // Main beam search algorithm
+    for (let i = 1; i < cycleLength; i++) {
+      const candidates: { path: string[]; score: number }[] = [];
+      for (const beam of beams) {
+        const lastToken = beam.path[beam.path.length - 1];
+        // Final position - need to close the cycle
+        if (i === cycleLength - 1) {
+          // Only option is to return to first token
+          const firstToken = beam.path[0];
+          // Check for liquidity
+          if (this.dexService.hasLiquidity(lastToken, firstToken)) {
+            const pathCopy = [...beam.path, firstToken];
+            const newScore = beam.score + this.dexService.getPairLiquidityScore(lastToken, firstToken);
+            candidates.push({ path: pathCopy, score: newScore });
           }
-          
-          const amountInFloat = parseFloat(ethers.formatUnits(amountIn, 18));
-          const amountOutFloat = parseFloat(ethers.formatUnits(out[1], 18));
-          const profit = amountOutFloat - amountInFloat;
-          const profitPercentage = (profit / amountInFloat) * 100;
-          
-          // Keep track of the best quote for this pair
-          if (profit > highestProfit) {
-            highestProfit = profit;
-            bestQuote = {
-              pair: `${from}-${to}`,
-              router,
-              amountIn: amountInFloat,
-              amountOut: amountOutFloat,
-              profit,
-              profitPercentage,
-              entropyFactor: 0.95 + Math.random() * 0.05,
-              from, 
-              to
-            };
-          }
-        } catch (e) {
-          // Skip errors for this amount
           continue;
         }
+
+        // Get candidate next tokens with liquidity
+        const candidateTokens = tokens.filter(token =>
+          !beam.path.includes(token) &&
+          this.dexService.hasLiquidity(lastToken, token)
+        );
+        // Generate next beam candidates
+        for (const token of candidateTokens) {
+          const pairLiquidityScore = this.dexService.getPairLiquidityScore(lastToken, token);
+          const tokenWeight = this.tokenService.getTokenWeight(token);
+          const pathCopy = [...beam.path, token];
+          // Apply entropy factor for exploration
+          const entropyFactor = 0.95 + Math.random() * 0.1;
+          const newScore = (beam.score + pairLiquidityScore * tokenWeight) * entropyFactor;
+          candidates.push({ path: pathCopy, score: newScore });
+        }
       }
-      
-      // If we found a quote with profit, add it
-      if (bestQuote && bestQuote.profit > 0) {
-        quotes.push(bestQuote);
+
+      // Sort and prune candidates
+      beams = candidates
+        .sort((a, b) => b.score - a.score)
+        .slice(0, beamWidth);
+      if (beams.length === 0) break;
+    }
+
+    // Convert beams to path arrays and filter invalid cycles
+    return beams
+      .filter(beam => beam.path.length === cycleLength)
+      .map(beam => beam.path);
+  }
+
+  /**
+   * Generate a random cycle for exploration
+   */
+  private _generateRandomCycle(tokens: string[], cycleLength: number): string[] {
+    const cycle: string[] = [];
+    const usedTokens = new Set<string>();
+    // First token selection - prioritize stablecoins or random token
+    const stablecoins = tokens.filter(token => this.tokenService.isStablecoin(token));
+    const firstToken = stablecoins.length > 0
+      ? stablecoins[Math.floor(Math.random() * stablecoins.length)]
+      : tokens[Math.floor(Math.random() * tokens.length)];
+    cycle.push(firstToken);
+    usedTokens.add(firstToken);
+    // Generate intermediate tokens
+    for (let i = 1; i < cycleLength - 1; i++) {
+      const lastToken = cycle[cycle.length - 1];
+      // Get candidate tokens that haven't been used yet
+      const candidates = tokens.filter(token =>
+        !usedTokens.has(token) && this.dexService.hasLiquidity(lastToken, token)
+      );
+      if (candidates.length === 0) {
+        // Failed to complete cycle, restart
+        return this._generateRandomCycle(tokens, cycleLength);
+      }
+
+      // Select random candidate
+      const nextToken = candidates[Math.floor(Math.random() * candidates.length)];
+      cycle.push(nextToken);
+      usedTokens.add(nextToken);
+    }
+
+    // Complete cycle by returning to first token
+    cycle.push(firstToken);
+    // Validate cycle
+    if (cycle.length !== cycleLength) {
+      return this._generateRandomCycle(tokens, cycleLength);
+    }
+
+    return cycle;
+  }
+
+  /**
+   * Evaluate cycles for profit potential
+   * Implements parallel processing with quantum-inspired optimization
+   */
+  private async evaluateCycles(cycles: string[][], pairs: TokenPair[]): Promise<DEXQuotes[][]> {
+    this.metrics.startOperation('cycleEvaluation');
+    try {
+      // Determine optimal batch size based on cycles length
+      const batchSize = this.options.adaptiveBatchSize
+        ? Math.min(Math.max(10, Math.floor(cycles.length / 20)), 50)
+        : 20;
+      logger.debug(`Evaluating ${cycles.length} cycles with batch size ${batchSize}`);
+      const profitableCycles: DEXQuotes[][] = [];
+      let processedCycles = 0;
+      // Process in batches with parallelization
+      for (let i = 0; i < cycles.length; i += batchSize) {
+        // Check if we should continue or have enough profitable cycles
+        if (profitableCycles.length >= config.MAX_PROFITABLE_CYCLES) {
+          logger.debug(`Reached maximum profitable cycles (${config.MAX_PROFITABLE_CYCLES}), stopping evaluation`);
+          break;
+        }
+
+        // Extract batch
+        const batch = cycles.slice(i, i + batchSize);
+        // Process batch in parallel
+        const batchPromises = batch.map(cycle => this.evaluateCycle(cycle));
+        const batchResults = await Promise.all(batchPromises);
+        // Filter profitable results
+        for (const quotes of batchResults) {
+          if (quotes.length > 0 && this.isCycleProfitable(quotes)) {
+            profitableCycles.push(quotes);
+            // Update pair scores for reinforcement learning
+            const pairKey = `${quotes[0].from}-${quotes[0].to}`;
+            this.updatePairScore(pairKey, true);
+          }
+        }
+
+        // Update progress
+        processedCycles += batch.length;
+        if (processedCycles % config.PROGRESS_INTERVAL === 0 || processedCycles === cycles.length) {
+          logger.info(`Processed ${processedCycles}/${cycles.length} cycles (${profitableCycles.length} profitable)`);
+        }
+      }
+
+      logger.info(`Found ${profitableCycles.length} profitable arbitrage opportunities`);
+      this.metrics.endOperation('cycleEvaluation');
+      return profitableCycles;
+    } catch (error) {
+      this.metrics.endOperation('cycleEvaluation', false);
+      throw error;
+    }
+  }
+
+  /**
+   * Evaluate a single cycle for arbitrage opportunity
+   * Applies quantum Ti stack for precision and causal verification
+   */
+  private async evaluateCycle(cycle: string[]): Promise<DEXQuotes[]> {
+    try {
+      const quotes: DEXQuotes[] = [];
+      // Test with multiple amounts for optimal sizing
+      for (const amountIn of config.TEST_AMOUNTS) {
+        let currentAmount = amountIn;
+        const cycleQuotes: DEXQuotes[] = [];
+        let cycleBroken = false;
+        // Evaluate each hop in the cycle
+        for (let i = 0; i < cycle.length - 1; i++) {
+          const from = cycle[i];
+          const to = cycle[i + 1];
+          try {
+            // Get quotes from multiple DEXes
+            const quoteResult = await this.dexService.getBestQuote(from, to, currentAmount);
+            if (!quoteResult || !quoteResult.bestQuote) {
+              cycleBroken = true;
+              break;
+            }
+
+            // Add to cycle quotes
+            cycleQuotes.push(quoteResult.bestQuote);
+            // Update current amount for next hop
+            currentAmount = quoteResult.bestQuote.amountOut;
+          } catch (error) {
+            cycleBroken = true;
+            break;
+          }
+        }
+
+        // If cycle completed successfully, check profitability
+        if (!cycleBroken && cycleQuotes.length === cycle.length - 1) {
+          // Calculate total profit
+          const initialAmount = cycleQuotes[0].amountIn;
+          const finalAmount = cycleQuotes[cycleQuotes.length - 1].amountOut;
+          if (finalAmount.gt(initialAmount)) {
+            // Mark as profitable
+            const profit = finalAmount.sub(initialAmount);
+            const profitPercentage = parseFloat(
+              ethers.66666666666666666666666666666666formatUnits(profit.mul(10000).div(initialAmount), 4)
+            );
+            // Add additional metadata
+            cycleQuotes[0].profitPercentage = profitPercentage;
+            cycleQuotes[0].entropyFactor = 0.95 + Math.random() * 0.05;
+            // Return profitable cycle quotes
+            return cycleQuotes;
+          }
+        }
+      }
+      // No profitable path found
+      return [];
+    } catch (error) {
+      logger.debug(`Error evaluating cycle: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Check if a cycle is profitable above threshold
+   */
+  private isCycleProfitable(quotes: DEXQuotes[]): boolean {
+    if (quotes.length === 0) return false;
+    const profitPercentage = quotes[0].profitPercentage;
+    if (profitPercentage === undefined) return false;
+    return profitPercentage >= config.MIN_PROFIT_PERCENTAGE;
+  }
+
+  /**
+   * Log top arbitrage opportunities
+   */
+  private logTopOpportunities(opportunities: DEXQuotes[][]): void {
+    logger.info('Top arbitrage opportunities:');
+    const topCount = Math.min(3, opportunities.length);
+    for (let i = 0; i < topCount; i++) {
+      const opportunity = opportunities[i];
+      if (opportunity.length === 0 || opportunity[0].profitPercentage === undefined) continue;
+      logger.info(` ${i+1}. Profit: ${opportunity[0].profitPercentage.toFixed(4)}% - Path: ${this.formatPath(opportunity)}`);
+    }
+  }
+
+  /**
+   * Format a path for logging
+   */
+  private formatPath(quotes: DEXQuotes[]): string {
+    if (!Array.isArray(quotes) || quotes.length === 0) return "Empty path";
+    const path = [this.tokenService.getTokenSymbol(quotes[0].from)];
+    for (const quote of quotes) {
+      path.push(this.tokenService.getTokenSymbol(quote.to));
+    }
+    return path.join(" → ");
+  }
+
+  /**
+   * Execute arbitrage transaction
+   * Uses quantum Te stack for implementation efficiency
+   */
+  private async executeArbitrage(quotes: DEXQuotes): Promise<boolean> {
+    if (this.executionInProgress) {
+      logger.warn('Arbitrage execution already in progress, skipping');
+      return false;
+    }
+
+    this.executionInProgress = true;
+    this.metrics.startOperation('arbitrageExecution');
+    try {
+      logger.info(`Executing arbitrage: ${quotes.pair} with projected profit ${quotes.profitPercentage}%`);
+      // Analyze opportunity with quantum stack
+      const strategy = this.stackIntegrator.analyzeOpportunity(quotes);
+      if ('profitable' in strategy && !strategy.profitable) {
+        logger.info('Opportunity no longer profitable after stack analysis');
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
+      }
+
+      // Get USD value of profit
+      const profitUsd = await this.getUsdValue(strategy.estimatedProfit, strategy.baseToken.address);
+      logger.info(`Estimated profit: $${profitUsd.toFixed(2)}`);
+      // Check if profit meets minimum threshold in USD
+      if (profitUsd < config.MIN_PROFIT_USD) {
+        logger.info(`Profit $${profitUsd.toFixed(2)} below minimum threshold $${config.MIN_PROFIT_USD.toFixed(2)}`);
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
+      }
+
+      // Get optimal execution parameters with quantum optimization
+      const gasParams = this.stackIntegrator.optimizeExecution({
+        strategy,
+        gasPrice: await this.provider.getGasPrice(),
+        blockTimestamp: Math.floor(Date.now() / 1000)
+      });
+
+      // Encode data for flash loan
+      let encodedData: string;
+      let routerSequence: string[];
+      if (strategy.path1.length > 2 || strategy.path2.length > 2) {
+        // Multi-hop route requires advanced encoding
+        encodedData = this.encodeMultiHopData(strategy);
+        routerSequence = [`Multi-hop route with ${strategy.path1.length + strategy.path2.length - 2} hops`];
       } else {
-        // If any pair fails, the whole cycle fails
-        return [];
+        // Standard route
+        encodedData = this.encodeStandardData(strategy);
+        routerSequence = [strategy.dex1, strategy.dex2];
       }
+
+      // Execute the transaction with optimal gas parameters
+      logger.info(`Submitting transaction with gas price ${ethers.utils.formatUnits(gasParams.gasPrice, 'gwei')} gwei, gas limit ${gasParams.gasLimit}`);
+      const tx = await this.flashLoanContract.executeArbitrage(
+        strategy.baseToken.address,
+        strategy.flashLoanAmount,
+        encodedData,
+        strategy.strategyHash,
+        {
+          gasPrice: gasParams.gasPrice,
+          gasLimit: gasParams.gasLimit
+        }
+      );
+
+      logger.info(`Transaction submitted: ${tx.hash}`);
+      // Wait for transaction confirmation
+      const receipt = await tx.wait();
+      // Process results
+      if (receipt.status === 1) {
+        // Transaction successful
+        logger.info(`Arbitrage executed successfully in block ${receipt.blockNumber}`);
+        // Parse events to get actual profit
+        const arbitrageEvent = receipt.events?.find(e => e.event === 'ArbitrageExecuted');
+        if (arbitrageEvent && arbitrageEvent.args) {
+          const actualProfit = ethers.utils.formatUnits(arbitrageEvent.args.profit, strategy.baseToken.decimals);
+          logger.info(`Actual profit: ${actualProfit} ${strategy.baseToken.symbol} ($${(parseFloat(actualProfit) * strategy.baseToken.priceUsd).toFixed(2)})`);
+          // Update pair scores with actual result
+          const pairKey = `${strategy.baseToken.address}-${strategy.quoteToken.address}`;
+          this.updatePairScore(pairKey, true, parseFloat(actualProfit));
+          // Update strategy performance metrics
+          await this.flashLoanContract.updateStrategyScore(
+            strategy.strategyHash,
+            Math.floor(strategy.optimalPathScore * 100)
+          ).catch(e => logger.warn(`Failed to update strategy score: ${e.message}`));
+        }
+
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution');
+        return true;
+      } else {
+        // Transaction failed
+        logger.error(`Arbitrage transaction failed`);
+        // Update pair scores with failure
+        const pairKey = `${strategy.baseToken.address}-${strategy.quoteToken.address}`;
+        this.updatePairScore(pairKey, false);
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
+      }
+    } catch (error) {
+      this.executionInProgress = false;
+      this.metrics.endOperation('arbitrageExecution', false);
+      this.handleError('arbitrage execution', error);
+      return false;
     }
-    
-    if (quotes.length === cycle.length - 1) {
-      const totalProfit = quotes.reduce((acc, q) => acc + q.profit, 0);
-      const profitPercentage = (totalProfit / quotes[0].amountIn) * 100;
-      (quotes[0] as any).projectedProfit = totalProfit;
-      (quotes[0] as any).profitPercentage = profitPercentage;
+  }
+
+  /**
+   * Encode data for standard two-token arbitrage
+   */
+  private encodeStandardData(strategy: ArbitrageStrategy): string {
+    const path = [...strategy.path1, ...strategy.path2.slice(1)];
+    return ethers.utils.defaultAbiCoder.encode(
+      ['address[]', 'uint256'],
+      [path, strategy.minAmountOut]
+    );
+  }
+
+  /**
+   * Encode data for multi-hop arbitrage
+   */
+  private encodeMultiHopData(strategy: ArbitrageStrategy): string {
+    // Prepare route segments
+    const routes: any[] = [];
+    // Add path1 segments
+    for (let i = 0; i < strategy.path1.length - 1; i++) {
+      const from = strategy.path1[i];
+      const to = strategy.path1[i + 1];
+      // Get router for this segment
+      const router = i === 0 ? strategy.dex1 : this.dexService.getBestRouterForPair(from, to);
+      // Encode segment
+      const segment = {
+        dexType: this.getDexType(router),
+        path: [from, to],
+        router
+      };
+      routes.push(segment);
     }
-    
-    return quotes;
+
+    // Add path2 segments
+    for (let i = 0; i < strategy.path2.length - 1; i++) {
+      const from = strategy.path2[i];
+      const to = strategy.path2[i + 1];
+      // Get router for this segment
+      const router = i === 0 ? strategy.dex2 : this.dexService.getBestRouterForPair(from, to);
+      // Encode segment
+      const segment = {
+        dexType: this.getDexType(router),
+        path: [from, to],
+        router
+      };
+      routes.push(segment);
+    }
+
+    // Encode routes
+    const encodedRoutes = routes.map(route => {
+      if (route.dexType === 0) {
+        // Standard AMM
+        return ethers.utils.defaultAbiCoder.encode(
+          ['uint8', 'bytes'],
+          [
+            0,
+            ethers.utils.defaultAbiCoder.encode(
+              ['address', 'address[]'],
+              [route.router, route.path]
+            )
+          ]
+        );
+      } else if (route.dexType === 1) {
+        // Uniswap V3
+        const path = this.encodeUniswapV3Path(route.path);
+        return ethers.utils.defaultAbiCoder.encode(
+          ['uint8', 'bytes'],
+          [
+            1,
+            ethers.utils.defaultAbiCoder.encode(
+              ['bytes', 'uint256'],
+              [path, 0] // Min amount out will be checked at the end
+            )
+          ]
+        );
+      }
+      // Fallback to standard AMM
+      return ethers.utils.defaultAbiCoder.encode(
+        ['uint8', 'bytes'],
+        [
+          0,
+          ethers.utils.defaultAbiCoder.encode(
+            ['address', 'address[]'],
+            [route.router, route.path]
+          )
+        ]
+      );
+    });
+
+    // Encode full multi-hop data
+    return ethers.utils.defaultAbiCoder.encode(
+      ['bytes[]', 'uint256'],
+      [encodedRoutes, strategy.minAmountOut]
+    );
+  }
+
+  /**
+   * Encode path for Uniswap V3
+   */
+  private encodeUniswapV3Path(path: string[]): string {
+    if (path.length < 2) return '0x';
+    // For each hop, encode token addresses and fees
+    let encoded = '';
+    for (let i = 0; i < path.length - 1; i++) {
+      const tokenA = path[i];
+      const tokenB = path[i + 1];
+      // Get fee from config or use default
+      const fee = config.UNISWAP_V3_FEES[`${tokenA}-${tokenB}`] ||
+        config.UNISWAP_V3_FEES[`${tokenB}-${tokenA}`] ||
+        3000; // Default fee: 0.3%
+      if (i === 0) {
+        // First token
+        encoded += tokenA.slice(2).toLowerCase();
+      }
+      // Encode fee and next token
+      encoded += fee.toString(16).padStart(6, '0') + tokenB.slice(2).toLowerCase();
+    }
+    return '0x' + encoded;
+  }
+
+  /**
+   * Get DEX type for router
+   */
+  private getDexType(router: string): number {
+    if (router.toLowerCase() === config.UNISWAP_V3_ROUTER.toLowerCase()) {
+      return 1; // Uniswap V3
+    }
+    // Default to standard AMM
+    return 0;
+  }
+
+  /**
+   * Get USD value for token amount
+   */
+  private async getUsdValue(
+    amount: ethers.BigNumber,
+    tokenAddress: string
+  ): Promise<number> {
+    try {
+      // Get token price
+      const priceUsd = await this.priceOracle.getTokenPrice(tokenAddress);
+      // Get token decimals
+      const token = this.tokenService.getTokenByAddress(tokenAddress);
+      const decimals = token?.decimals || 18;
+      // Calculate USD value
+      const amountFormatted = parseFloat(ethers.utils.formatUnits(amount, decimals));
+      return amountFormatted * priceUsd;
+    } catch (error) {
+      logger.warn(`Error getting USD value: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Error handling
+   */
+  private handleError(operation: string, error: unknown): void {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error(`Error in ${operation}: ${errorMessage}`);
+    if (error instanceof Error && error.stack) {
+      logger.debug(`Stack trace: ${error.stack}`);
+    }
+    this.emit('error', { operation, error });
+  }
+
+  /**
+   * Get bot statistics
+   */
+  public getStatistics(): any {
+    return {
+      isRunning: this.isRunning,
+      totalDetections: this.metrics.getOperationCount('opportunityDetection'),
+      successfulDetections: this.metrics.getOperationSuccessCount('opportunityDetection'),
+      totalExecutions: this.metrics.getOperationCount('arbitrageExecution'),
+      successfulExecutions: this.metrics.getOperationSuccessCount('arbitrageExecution'),
+      averageDetectionTime: this.metrics.getAverageOperationTime('opportunityDetection'),
+      averageExecutionTime: this.metrics.getAverageOperationTime('arbitrageExecution'),
+      activePairs: this.pairScores.size,
+      topPairs: Array.from(this.pairScores.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([pair, score]) => ({ pair, score }))
+    };
   }
 }
+
