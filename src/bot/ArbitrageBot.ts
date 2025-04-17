@@ -1,47 +1,112 @@
 // src/bot/ArbitrageBot.ts
 
-import {
-  formatUnits,
-  parseUnits,
-  JsonRpcProvider,
-  WebSocketProvider,
-  Contract,
-  Wallet,
-  BigNumber,
-  AbiCoder,
-  isError
-} from "ethers";
-
-import { StackIntegrator } from '../stacks/StackIntegrator';
-import { PriceOracle } from '../utils/PriceOracle';
-import { DEXQuotes, ArbitrageStrategy, TokenPair } from '../types/ArbitrageTypes';
+import { ethers } from "ethers";
+import { EventEmitter } from 'events';
 import { logger } from '../utils/Logger';
 import { config } from '../config/Config';
-import { MulticallProvider } from '../utils/MulticallProvider';
 import { TokenService } from '../services/TokenService';
 import { DEXService } from '../services/DEXService';
 import { PerformanceMetrics } from '../utils/PerformanceMetrics';
-import { EventEmitter } from 'events';
-import { ArbitrageCoreABI } from '../abis/ArbitrageCoreABI';
-import { RouterABI } from '../abis/RouterABI';
-import { IERC20ABI } from '../abis/IERC20ABI';
+import { StackIntegrator } from '../stacks/StackIntegrator';
 
-/**
- * Event types for ArbitrageBot
- */
+// Type definitions
+export interface Token {
+  symbol: string;
+  address: string;
+  decimals: number;
+  priceUsd?: number;
+}
+
+export interface TokenPair {
+  name: string;
+  baseToken: string;
+  quoteToken: string;
+  volatility?: number;
+}
+
+export interface DEXQuote {
+  dex: string;
+  path: string[];
+  amountIn: ethers.BigNumber;
+  amountOut: ethers.BigNumber; 
+  gasEstimate: ethers.BigNumber;
+}
+
+export interface DEXQuotes {
+  pair: string;
+  baseToken: Token;
+  quoteToken: Token;
+  from: string;
+  to: string;
+  amountIn: ethers.BigNumber;
+  quickswap: {
+    forwardOut: ethers.BigNumber;
+    reverseOut: ethers.BigNumber;
+  };
+  sushiswap: {
+    forwardOut: ethers.BigNumber;
+    reverseOut: ethers.BigNumber;
+  };
+  profitPercentage?: number;
+  entropyFactor: number;
+  projectedProfit?: number;
+  amountOut?: ethers.BigNumber;
+}
+
+export interface ArbitrageStrategy {
+  pair: string;
+  baseToken: Token;
+  quoteToken: Token;
+  dex1: string;
+  dex2: string;
+  path1: string[];
+  path2: string[];
+  amountIn: ethers.BigNumber;
+  flashLoanAmount: ethers.BigNumber;
+  minAmountOut: ethers.BigNumber;
+  estimatedProfit: ethers.BigNumber;
+  profitPercentage: number;
+  profitUsd: number;
+  optimalPathScore: number;
+  strategyHash: string;
+  entropyFactor: number;
+}
+
 interface ArbitrageBotEvents {
   started: void;
   stopped: void;
-  error: {operation: string, error: unknown};
+  error: {operation: string, error: Error};
+  opportunity: ArbitrageStrategy;
+  execution: {strategy: ArbitrageStrategy, success: boolean, profit?: string};
 }
 
-/**
- * Type for EventEmitter with strongly-typed events
- */
 type TypedEventEmitter<T> = Omit<EventEmitter, "on" | "emit"> & {
-  on<K extends keyof T>(event: K, listener: (arg: T[K]) => void): this;
+  on<K extends keyof T>(event: K, listener: (arg: T[K]) => void): TypedEventEmitter<T>;
   emit<K extends keyof T>(event: K, arg: T[K]): boolean;
 };
+
+// ABI definitions - ensure these files exist in your project
+const ArbitrageCoreABI = [
+  "function executeArbitrage(address token, uint256 amount, bytes calldata data, bytes32 strategyHash) external",
+  "function updateStrategyScore(bytes32 strategyHash, uint256 score) external",
+  "function setPaused(bool _paused) external",
+  "function setMinProfitThreshold(uint256 _minProfitThreshold) external",
+  "event ArbitrageExecuted(address indexed token, uint256 profit, bytes32 strategyHash, uint256 timestamp)",
+  "event FlashLoanExecuted(address indexed token, uint256 amount, uint256 fee)"
+];
+
+const RouterABI = [
+  "function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+];
+
+const IERC20ABI = [
+  "function balanceOf(address account) external view returns (uint256)",
+  "function allowance(address owner, address spender) external view returns (uint256)",
+  "function approve(address spender, uint256 amount) external returns (bool)",
+  "function transfer(address recipient, uint256 amount) external returns (bool)",
+  "function transferFrom(address sender, address recipient, uint256 amount) external returns (bool)"
+];
 
 /**
  * Enhanced ArbitrageBot with quantum-inspired optimization
@@ -50,16 +115,17 @@ type TypedEventEmitter<T> = Omit<EventEmitter, "on" | "emit"> & {
 export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<ArbitrageBotEvents> {
   // Stacks and services
   private stackIntegrator: StackIntegrator;
-  private priceOracle: PriceOracle;
   private tokenService: TokenService;
   private dexService: DEXService;
   private metrics: PerformanceMetrics;
 
   // Blockchain connectivity
-  private provider: JsonRpcProvider;
-  private multicallProvider: MulticallProvider;
-  private wallet: Wallet;
-  private flashLoanContract: Contract;
+  private provider: ethers.providers.Provider;
+  private multicallProvider: any; // Replace with your actual MulticallProvider type
+  private wallet: ethers.Wallet;
+  private flashLoanContract: ethers.Contract;
+  private quickswapRouter: ethers.Contract;
+  private sushiswapRouter: ethers.Contract;
 
   // Runtime state
   private isRunning: boolean = false;
@@ -67,20 +133,32 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   private executionInProgress: boolean = false;
   private lastDetectionTime: number = 0;
   private detectionInterval: NodeJS.Timeout | null = null;
-  private blockSubscription: WebSocketProvider | null = null;
+  private blockSubscription: any = null;
 
   // Performance optimization
   private opportunityCache: Map<string, any> = new Map();
   private pathCache: Map<string, { timestamp: number; paths: string[][] }> = new Map();
   private pairScores: Map<string, number> = new Map();
   private cacheValidityPeriod = 30 * 1000; // 30 seconds
-  private explorationRatio = 0.1; // 10% of cycles are random for exploration
 
   // Configuration
   private readonly parallelismFactor = 3;
   private readonly maxConcurrentOperations = 5;
   private readonly minTimeBetweenDetections = 5000; // 5 seconds
   private activeOperations = 0;
+
+  // Uniswap V3 fee tiers
+  private readonly uniswapV3Fees: { [key: string]: number } = {
+    // Common fee tiers based on token volatility
+    'WETH-USDC': 500,   // 0.05% for stable pairs
+    'WETH-USDT': 500,   // 0.05% for stable pairs
+    'WETH-DAI': 500,    // 0.05% for stable pairs
+    'WETH-WBTC': 3000,  // 0.3% for standard pairs
+    'WMATIC-WETH': 3000, // 0.3% for standard pairs
+    'WMATIC-USDC': 500, // 0.05% for stable pairs
+    'WBTC-USDC': 3000,  // 0.3% for standard pairs
+    // Default to 0.3% (3000) if not specified
+  };
 
   constructor(
     private readonly flashLoanAddress: string,
@@ -110,29 +188,39 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     };
 
     // Initialize connections
-    this.provider = new JsonRpcProvider(rpcUrl);
-    this.wallet = new Wallet(this.privateKey, this.provider);
-    this.multicallProvider = new MulticallProvider(this.provider);
-
+    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    this.wallet = new ethers.Wallet(this.privateKey, this.provider);
+    
     // Initialize contracts
-    this.flashLoanContract = new Contract(
+    this.flashLoanContract = new ethers.Contract(
       this.flashLoanAddress,
       ArbitrageCoreABI,
       this.wallet
     );
+    
+    this.quickswapRouter = new ethers.Contract(
+      config.QUICKSWAP_ROUTER,
+      RouterABI,
+      this.wallet
+    );
+    
+    this.sushiswapRouter = new ethers.Contract(
+      config.SUSHISWAP_ROUTER,
+      RouterABI,
+      this.wallet
+    );
 
-    // Initialize core services
-    this.tokenService = new TokenService(this.multicallProvider);
-    this.dexService = new DEXService(this.multicallProvider, config);
-    this.priceOracle = new PriceOracle();
+    // Initialize core services - these should be imported from your services directory
+    this.tokenService = new TokenService(this.provider);
+    this.dexService = new DEXService(this.provider, config);
     this.metrics = new PerformanceMetrics();
 
     // Initialize quantum stack integration
     this.stackIntegrator = new StackIntegrator({
-      keystoneActivation: this.options.keystoneActivation,
-      tiDominantWeight: this.options.tiDominantWeight,
-      neDominantWeight: this.options.neDominantWeight,
-      entropy: this.options.entropy
+      keystoneActivation: Boolean(this.options.keystoneActivation),
+      tiDominantWeight: Number(this.options.tiDominantWeight),
+      neDominantWeight: Number(this.options.neDominantWeight),
+      entropy: Number(this.options.entropy)
     });
 
     logger.info('ArbitrageBot initialized with quantum-enhanced parameters');
@@ -163,9 +251,9 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       this.emit('started');
     } catch (error) {
       this.isRunning = false;
-      const errorMessage = isError(error) ? error.message : String(error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error(`Failed to start ArbitrageBot: ${errorMessage}`);
-      this.emit('error', {operation: 'start', error});
+      this.emit('error', {operation: 'start', error: new Error(errorMessage)});
       throw error;
     }
   }
@@ -200,19 +288,22 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Initialize required services before starting
    */
   private async initializeServices(): Promise<void> {
-    // Initialize tokens with parallel loading
-    const tokensPromise = this.tokenService.loadTokens(config.TOKENS);
-    // Initialize DEX routers with parallel loading
-    const dexPromise = this.dexService.initializeDEXs();
-    // Initialize price feeds
-    const pricePromise = this.priceOracle.initialize();
-    
-    // Wait for all initializations to complete
-    await Promise.all([tokensPromise, dexPromise, pricePromise]);
-    // Warm up token pair cache
-    await this.tokenService.preloadCommonPairs(config.TOKEN_PAIRS);
-    
-    logger.info('Services initialized successfully');
+    try {
+      // Initialize tokens
+      await this.tokenService.loadTokens(config.TOKENS);
+      
+      // Initialize DEX routers
+      await this.dexService.initializeDEXs();
+      
+      // Warm up token pair cache
+      await this.tokenService.preloadCommonPairs(config.TOKEN_PAIRS);
+      
+      logger.info('Services initialized successfully');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to initialize services: ${errorMessage}`);
+      throw new Error(`Service initialization failed: ${errorMessage}`);
+    }
   }
 
   /**
@@ -224,11 +315,18 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     }
 
     try {
-      const wsProvider = new WebSocketProvider(this.wsRpcUrl);
-      // Ensure connection is established
-      await wsProvider.waitForReady();
+      const wsProvider = new ethers.providers.WebSocketProvider(this.wsRpcUrl);
       
-      wsProvider.on('block', async (blockNumber: number) => {
+      // Ensure connection is established - wait for provider to be ready
+      await new Promise<void>((resolve) => {
+        if (wsProvider.ready) {
+          resolve();
+        } else {
+          wsProvider.once('ready', () => resolve());
+        }
+      });
+      
+      wsProvider.on('block', async (blockNumber) => {
         if (this.shouldSkipDetection()) return;
         
         logger.debug(`New block detected: ${blockNumber}`);
@@ -240,7 +338,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       this.blockSubscription = wsProvider;
       logger.info('Block subscription established');
     } catch (error) {
-      logger.error(`Failed to setup WebSocket connection: ${isError(error) ? error.message : String(error)}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to setup WebSocket connection: ${errorMessage}`);
       logger.info('Falling back to interval-based detection');
       this.setupIntervalDetection();
     }
@@ -260,12 +359,17 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       if (this.shouldSkipDetection()) return;
       
       this.lastDetectionTime = Date.now();
-      const blockNumber = await this.provider.getBlockNumber();
-      this.checkArbitrageOpportunities(blockNumber)
-        .catch(error => this.handleError('interval detection', error));
-    }, config.DETECTION_INTERVAL);
+      try {
+        const blockNumber = await this.provider.getBlockNumber();
+        this.checkArbitrageOpportunities(blockNumber)
+          .catch(error => this.handleError('interval detection', error));
+      } catch (error) {
+        this.handleError('block number retrieval', error);
+      }
+    }, config.DETECTION_INTERVAL || 15000);
     
-    logger.info(`Interval-based detection started with ${config.DETECTION_INTERVAL}ms frequency`);
+    const interval = config.DETECTION_INTERVAL || 15000;
+    logger.info(`Interval-based detection started with ${interval}ms frequency`);
   }
 
   /**
@@ -304,10 +408,10 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       this.metrics.startOperation('opportunityDetection');
       logger.info(`Checking arbitrage opportunities at block ${blockNumber}`);
       
-      // Phase 1: Generate pairs and paths
+      // Phase 1: Generate pairs and tokens
       const { pairs, tokens } = await this.generatePairsAndTokens();
       
-      // Phase 2: Generate potential arbitrage cycles
+      // Phase 2: Generate potential arbitrage cycles using Ti stack optimization
       const cycles = this.generateArbitrageCycles(tokens);
       
       // Phase 3: Evaluate cycles for profit potential
@@ -316,17 +420,18 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       // Phase 4: Execute profitable arbitrage if found
       if (opportunities.length > 0) {
         // Sort by profitability
-        opportunities.sort((a, b) => {
-          if (!a[0]?.profitPercentage || !b[0]?.profitPercentage) return 0;
-          return b[0].profitPercentage - a[0].profitPercentage;
+        const sortedOpportunities = opportunities.sort((a, b) => {
+          const aProfit = a[0]?.profitPercentage ?? 0;
+          const bProfit = b[0]?.profitPercentage ?? 0;
+          return bProfit - aProfit;
         });
         
         // Log top opportunities
-        this.logTopOpportunities(opportunities);
+        this.logTopOpportunities(sortedOpportunities);
         
         // Find best opportunity using quantum stack integration
-        const allQuotes = opportunities.flatMap(group => group);
-        const best = this.stackIntegrator.evaluate(allQuotes, opportunities);
+        const allQuotes = sortedOpportunities.flatMap(group => group);
+        const best = this.stackIntegrator.evaluate(allQuotes, sortedOpportunities);
         
         if (best) {
           await this.executeArbitrage(best);
@@ -363,7 +468,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       const prioritizedPairs = this.prioritizePairs(allPairs);
       
       // Limit to configured maximum
-      const pairs = prioritizedPairs.slice(0, config.MAX_PAIRS_TO_USE);
+      const maxPairs = config.MAX_PAIRS_TO_USE || 400;
+      const pairs = prioritizedPairs.slice(0, maxPairs);
       
       // Extract unique tokens from pairs
       const allTokens = Array.from(new Set(
@@ -374,14 +480,16 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       ));
       
       // Prioritize tokens
-      const tokens = allTokens.slice(0, config.MAX_TOKENS_TO_CONSIDER);
+      const maxTokens = config.MAX_TOKENS_TO_CONSIDER || 40;
+      const tokens = allTokens.slice(0, maxTokens);
       
       logger.info(`Generated ${pairs.length} pairs with ${tokens.length} unique tokens`);
       this.metrics.endOperation('pairGeneration');
       return { pairs, tokens };
     } catch (error) {
       this.metrics.endOperation('pairGeneration', false);
-      throw error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to generate pairs and tokens: ${errorMessage}`);
     }
   }
 
@@ -458,21 +566,27 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
 
       // Generate cycles for different cycle lengths
       let allCycles: string[][] = [];
-      for (const cycleLength of config.CYCLE_LENGTHS) {
+      const cycleLengths = config.CYCLE_LENGTHS || [3, 4];
+      
+      for (const cycleLength of cycleLengths) {
         const cycles = this._generateCyclesOfLength(tokens, cycleLength);
         // Store in map
         cyclesByLength.set(cycleLength, cycles);
         // Add to overall list with limit
+        const maxCyclesPerLength = config.MAX_CYCLES_PER_LENGTH || 1000;
         allCycles = allCycles.concat(
-          cycles.slice(0, config.MAX_CYCLES_PER_LENGTH)
+          cycles.slice(0, maxCyclesPerLength)
         );
-        if (allCycles.length >= config.MAX_CYCLES) {
+        
+        const maxCycles = config.MAX_CYCLES || 2000;
+        if (allCycles.length >= maxCycles) {
           break;
         }
       }
 
       // Randomize a portion of results to encourage exploration
-      const explorationCount = Math.floor(allCycles.length * this.explorationRatio);
+      const explorationRatio = 0.1;
+      const explorationCount = Math.floor(allCycles.length * explorationRatio);
       if (explorationCount > 0) {
         const explorationIndices = new Set<number>();
         while (explorationIndices.size < explorationCount) {
@@ -497,7 +611,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       return allCycles;
     } catch (error) {
       this.metrics.endOperation('cycleGeneration', false);
-      throw error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to generate arbitrage cycles: ${errorMessage}`);
     }
   }
 
@@ -628,11 +743,13 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       logger.debug(`Evaluating ${cycles.length} cycles with batch size ${batchSize}`);
       const profitableCycles: DEXQuotes[][] = [];
       let processedCycles = 0;
+      
       // Process in batches with parallelization
       for (let i = 0; i < cycles.length; i += batchSize) {
         // Check if we should continue or have enough profitable cycles
-        if (profitableCycles.length >= config.MAX_PROFITABLE_CYCLES) {
-          logger.debug(`Reached maximum profitable cycles (${config.MAX_PROFITABLE_CYCLES}), stopping evaluation`);
+        const maxProfitableCycles = config.MAX_PROFITABLE_CYCLES || 20;
+        if (profitableCycles.length >= maxProfitableCycles) {
+          logger.debug(`Reached maximum profitable cycles (${maxProfitableCycles}), stopping evaluation`);
           break;
         }
 
@@ -641,19 +758,23 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         // Process batch in parallel
         const batchPromises = batch.map(cycle => this.evaluateCycle(cycle));
         const batchResults = await Promise.all(batchPromises);
+        
         // Filter profitable results
         for (const quotes of batchResults) {
           if (quotes.length > 0 && this.isCycleProfitable(quotes)) {
             profitableCycles.push(quotes);
             // Update pair scores for reinforcement learning
-            const pairKey = `${quotes[0].from}-${quotes[0].to}`;
-            this.updatePairScore(pairKey, true);
+            if (quotes[0] && quotes[0].from && quotes[0].to) {
+              const pairKey = `${quotes[0].from}-${quotes[0].to}`;
+              this.updatePairScore(pairKey, true);
+            }
           }
         }
 
         // Update progress
         processedCycles += batch.length;
-        if (processedCycles % config.PROGRESS_INTERVAL === 0 || processedCycles === cycles.length) {
+        const progressInterval = config.PROGRESS_INTERVAL || 50;
+        if (processedCycles % progressInterval === 0 || processedCycles === cycles.length) {
           logger.info(`Processed ${processedCycles}/${cycles.length} cycles (${profitableCycles.length} profitable)`);
         }
       }
@@ -663,7 +784,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       return profitableCycles;
     } catch (error) {
       this.metrics.endOperation('cycleEvaluation', false);
-      throw error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to evaluate cycles: ${errorMessage}`);
     }
   }
 
@@ -675,11 +797,17 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     try {
       const quotes: DEXQuotes[] = [];
       // Test with multiple amounts for optimal sizing
-      for (const amountInStr of config.TEST_AMOUNTS) {
-        const amountIn = BigInt(amountInStr);
+      const testAmounts = config.TEST_AMOUNTS || [
+        ethers.utils.parseEther("10"),
+        ethers.utils.parseEther("100"),
+        ethers.utils.parseEther("1000")
+      ];
+      
+      for (const amountIn of testAmounts) {
         let currentAmount = amountIn;
         const cycleQuotes: DEXQuotes[] = [];
         let cycleBroken = false;
+        
         // Evaluate each hop in the cycle
         for (let i = 0; i < cycle.length - 1; i++) {
           const from = cycle[i];
@@ -692,8 +820,35 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
               break;
             }
 
+            // Construct DEXQuotes object with required properties
+            const dexQuote: DEXQuotes = {
+              ...quoteResult.bestQuote,
+              pair: `${from}-${to}`,
+              from,
+              to,
+              baseToken: this.tokenService.getTokenByAddress(from) as Token,
+              quoteToken: this.tokenService.getTokenByAddress(to) as Token,
+              amountIn: currentAmount,
+              quickswap: {
+                forwardOut: ethers.BigNumber.from(0),
+                reverseOut: ethers.BigNumber.from(0)
+              },
+              sushiswap: {
+                forwardOut: ethers.BigNumber.from(0),
+                reverseOut: ethers.BigNumber.from(0)
+              },
+              entropyFactor: 0.95 + Math.random() * 0.05
+            };
+            
+            // Update with actual DEX quotes
+            if (quoteResult.bestQuote.dex === 'quickswap') {
+              dexQuote.quickswap.forwardOut = quoteResult.bestQuote.amountOut;
+            } else if (quoteResult.bestQuote.dex === 'sushiswap') {
+              dexQuote.sushiswap.forwardOut = quoteResult.bestQuote.amountOut;
+            }
+
             // Add to cycle quotes
-            cycleQuotes.push(quoteResult.bestQuote);
+            cycleQuotes.push(dexQuote);
             // Update current amount for next hop
             currentAmount = quoteResult.bestQuote.amountOut;
           } catch (error) {
@@ -706,17 +861,19 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         if (!cycleBroken && cycleQuotes.length === cycle.length - 1) {
           // Calculate total profit
           const initialAmount = cycleQuotes[0].amountIn;
-          const finalAmount = cycleQuotes[cycleQuotes.length - 1].amountOut;
-          if (finalAmount > initialAmount) {
+          const finalAmount = cycleQuotes[cycleQuotes.length - 1].amountOut || ethers.BigNumber.from(0);
+          
+          if (finalAmount.gt(initialAmount)) {
             // Mark as profitable
-            const profit = finalAmount - initialAmount;
-            const profitPercentage = Number(formatUnits(
-              (profit * BigInt(10000)) / initialAmount, 
-              4
-            ));
+            const profit = finalAmount.sub(initialAmount);
+            const profitPercentage = parseFloat(
+              ethers.utils.formatEther(profit.mul(10000).div(initialAmount))
+            ) / 100;
+            
             // Add additional metadata
             cycleQuotes[0].profitPercentage = profitPercentage;
             cycleQuotes[0].entropyFactor = 0.95 + Math.random() * 0.05;
+            
             // Return profitable cycle quotes
             return cycleQuotes;
           }
@@ -725,7 +882,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       // No profitable path found
       return [];
     } catch (error) {
-      logger.debug(`Error evaluating cycle: ${isError(error) ? error.message : String(error)}`);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logger.debug(`Error evaluating cycle: ${errorMessage}`);
       return [];
     }
   }
@@ -734,10 +892,13 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Check if a cycle is profitable above threshold
    */
   private isCycleProfitable(quotes: DEXQuotes[]): boolean {
-    if (quotes.length === 0) return false;
+    if (quotes.length === 0 || !quotes[0]) return false;
+    
     const profitPercentage = quotes[0].profitPercentage;
     if (profitPercentage === undefined) return false;
-    return profitPercentage >= config.MIN_PROFIT_PERCENTAGE;
+    
+    const minProfitPercentage = config.MIN_PROFIT_PERCENTAGE || 0.05;
+    return profitPercentage >= minProfitPercentage;
   }
 
   /**
@@ -746,9 +907,12 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   private logTopOpportunities(opportunities: DEXQuotes[][]): void {
     logger.info('Top arbitrage opportunities:');
     const topCount = Math.min(3, opportunities.length);
+    
     for (let i = 0; i < topCount; i++) {
       const opportunity = opportunities[i];
-      if (opportunity.length === 0 || opportunity[0].profitPercentage === undefined) continue;
+      if (!opportunity || opportunity.length === 0 || !opportunity[0] || opportunity[0].profitPercentage === undefined) {
+        continue;
+      }
       logger.info(` ${i+1}. Profit: ${opportunity[0].profitPercentage.toFixed(4)}% - Path: ${this.formatPath(opportunity)}`);
     }
   }
@@ -757,17 +921,23 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Format a path for logging
    */
   private formatPath(quotes: DEXQuotes[]): string {
-    if (!Array.isArray(quotes) || quotes.length === 0) return "Empty path";
+    if (!Array.isArray(quotes) || quotes.length === 0 || !quotes[0]) {
+      return "Empty path";
+    }
+    
     const path = [this.tokenService.getTokenSymbol(quotes[0].from || '')];
     for (const quote of quotes) {
-      path.push(this.tokenService.getTokenSymbol(quote.to || ''));
+      if (quote && quote.to) {
+        path.push(this.tokenService.getTokenSymbol(quote.to || ''));
+      }
     }
+    
     return path.join(" → ");
   }
 
   /**
    * Execute arbitrage transaction
-   * Uses quantum Te stack for implementation efficiency
+   * Uses quantum stack integration for optimized execution path
    */
   private async executeArbitrage(quotes: DEXQuotes): Promise<boolean> {
     if (this.executionInProgress) {
@@ -777,90 +947,162 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
 
     this.executionInProgress = true;
     this.metrics.startOperation('arbitrageExecution');
+    
     try {
+      if (!quotes.pair || !quotes.profitPercentage) {
+        throw new Error('Invalid quotes object, missing required properties');
+      }
+      
       logger.info(`Executing arbitrage: ${quotes.pair} with projected profit ${quotes.profitPercentage}%`);
-      // Analyze opportunity with quantum stack
+      
+      // Apply Ti stack logical verification
+      const isLogicallyConsistent = this.stackIntegrator.validateLogicalConsistency({
+        path: [quotes.from, quotes.to],
+        profit: quotes.profitPercentage,
+        entropyFactor: quotes.entropyFactor
+      });
+      
+      if (!isLogicallyConsistent) {
+        logger.info('Opportunity failed logical consistency verification');
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
+      }
+      
+      // Analyze opportunity with quantum stack integration
       const strategy = this.stackIntegrator.analyzeOpportunity(quotes);
-      if ('profitable' in strategy && !strategy.profitable) {
+      
+      if (!strategy || strategy.profitPercentage < (config.MIN_PROFIT_THRESHOLD || 0.5)) {
         logger.info('Opportunity no longer profitable after stack analysis');
         this.executionInProgress = false;
         this.metrics.endOperation('arbitrageExecution', false);
         return false;
       }
 
-      // Make TypeScript happy with a validated strategy
-      const validStrategy = strategy as Exclude<typeof strategy, { profitable: false }>;
+      // Apply Ne stack for creative execution optimization
+      const executionParams = this.stackIntegrator.optimizeExecutionParameters({
+        strategy,
+        blockNumber: await this.provider.getBlockNumber(),
+        gasPrice: await this.provider.getGasPrice(),
+        networkCongestion: await this.getNetworkCongestion(),
+        maxSlippage: config.SLIPPAGE_TOLERANCE || 100 // 1% default
+      });
 
-      // Get USD value of profit
-      const profitUsd = await this.getUsdValue(validStrategy.estimatedProfit, validStrategy.baseToken.address);
+      // Get USD value of profit using Si stack for experiential validation
+      const profitUsd = await this.getUsdValue(
+        strategy.baseToken.address,
+        strategy.estimatedProfit
+      );
+      
       logger.info(`Estimated profit: $${profitUsd.toFixed(2)}`);
-      // Check if profit meets minimum threshold in USD
-      if (profitUsd < config.MIN_PROFIT_USD) {
-        logger.info(`Profit $${profitUsd.toFixed(2)} below minimum threshold $${config.MIN_PROFIT_USD.toFixed(2)}`);
+      
+      // Check if profit meets minimum threshold in USD with margin for gas costs
+      const minProfitUsd = config.MIN_PROFIT_USD || 1.0;
+      if (profitUsd < minProfitUsd * executionParams.profitMarginFactor) {
+        logger.info(`Profit $${profitUsd.toFixed(2)} below adjusted threshold $${(minProfitUsd * executionParams.profitMarginFactor).toFixed(2)}`);
         this.executionInProgress = false;
         this.metrics.endOperation('arbitrageExecution', false);
         return false;
       }
 
-      // Get optimal execution parameters with quantum optimization
-      const gasParams = this.stackIntegrator.optimizeExecution({
-        strategy: validStrategy,
-        gasPrice: await this.provider.getFeeData().then(fees => fees.gasPrice || BigInt(0)),
-        blockTimestamp: Math.floor(Date.now() / 1000)
+      // Encode data for flash loan with Te stack optimization
+      const encodedData = this.stackIntegrator.encodeStrategyData(strategy);
+      
+      // Apply gas optimization with Te stack
+      const gasLimit = executionParams.gasLimit || ethers.BigNumber.from(config.GAS_LIMIT || 2000000);
+      const optimizedGasPrice = executionParams.gasPrice || await this.provider.getGasPrice();
+      
+      // Apply keystone integration for final validation
+      const executionApproved = this.stackIntegrator.approveExecution({
+        strategy,
+        gasPrice: optimizedGasPrice,
+        gasLimit,
+        deadline: Math.floor(Date.now() / 1000) + 300, // 5 minutes
+        networkConditions: {
+          blockNumber: await this.provider.getBlockNumber(),
+          congestion: await this.getNetworkCongestion()
+        }
       });
-
-      // Encode data for flash loan
-      let encodedData: string;
-      let routerSequence: string[];
-      if (validStrategy.path1.length > 2 || validStrategy.path2.length > 2) {
-        // Multi-hop route requires advanced encoding
-        encodedData = this.encodeMultiHopData(validStrategy);
-        routerSequence = [`Multi-hop route with ${validStrategy.path1.length + validStrategy.path2.length - 2} hops`];
-      } else {
-        // Standard route
-        encodedData = this.encodeStandardData(validStrategy);
-        routerSequence = [validStrategy.dex1, validStrategy.dex2];
+      
+      if (!executionApproved) {
+        logger.info('Execution rejected by keystone stack integration');
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
       }
-
-      // Execute the transaction with optimal gas parameters
-      logger.info(`Submitting transaction with gas price ${formatUnits(gasParams.gasPrice, 'gwei')} gwei, gas limit ${gasParams.gasLimit}`);
+      
+      // Execute the transaction with quantum-optimized parameters
+      logger.info(`Submitting transaction with gas price ${ethers.utils.formatUnits(optimizedGasPrice, 'gwei')} gwei, gas limit ${gasLimit.toString()}`);
+      
       const tx = await this.flashLoanContract.executeArbitrage(
-        validStrategy.baseToken.address,
-        validStrategy.flashLoanAmount,
+        strategy.baseToken.address,
+        strategy.flashLoanAmount,
         encodedData,
-        validStrategy.strategyHash,
+        strategy.strategyHash,
         {
-          gasPrice: gasParams.gasPrice,
-          gasLimit: gasParams.gasLimit
+          gasPrice: optimizedGasPrice,
+          gasLimit
         }
       );
 
       logger.info(`Transaction submitted: ${tx.hash}`);
-      // Wait for transaction confirmation
-      const receipt = await tx.wait();
+      
+      // Wait for transaction confirmation with timeout
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 60000)) // 60 second timeout
+      ]);
+      
+      if (!receipt) {
+        logger.warn(`Transaction confirmation timeout after 60 seconds: ${tx.hash}`);
+        this.executionInProgress = false;
+        this.metrics.endOperation('arbitrageExecution', false);
+        return false;
+      }
+      
       // Process results
-      if (receipt?.status === 1) {
+      if (receipt.status === 1) {
         // Transaction successful
         logger.info(`Arbitrage executed successfully in block ${receipt.blockNumber}`);
-        // Parse events to get actual profit
-        const eventData = receipt.logs?.find(
-          log => this.flashLoanContract.interface.parseLog(log)?.name === 'ArbitrageExecuted'
-        );
         
-        if (eventData) {
-          const parsedLog = this.flashLoanContract.interface.parseLog(eventData);
-          if (parsedLog && parsedLog.args) {
-            const actualProfit = formatUnits(parsedLog.args.profit, validStrategy.baseToken.decimals);
-            logger.info(`Actual profit: ${actualProfit} ${validStrategy.baseToken.symbol} ($${(parseFloat(actualProfit) * validStrategy.baseToken.priceUsd).toFixed(2)})`);
-            // Update pair scores with actual result
-            const pairKey = `${validStrategy.baseToken.address}-${validStrategy.quoteToken.address}`;
-            this.updatePairScore(pairKey, true, parseFloat(actualProfit));
-            // Update strategy performance metrics
-            await this.flashLoanContract.updateStrategyScore(
-              validStrategy.strategyHash,
-              Math.floor(validStrategy.optimalPathScore * 100)
-            ).catch(e => logger.warn(`Failed to update strategy score: ${isError(e) ? e.message : String(e)}`));
-          }
+        // Parse events to get actual profit with Fe stack integration for event analysis
+        const arbitrageEvent = receipt.logs
+          .map(log => {
+            try {
+              return this.flashLoanContract.interface.parseLog(log);
+            } catch (e) {
+              return null;
+            }
+          })
+          .find(parsedLog => parsedLog && parsedLog.name === 'ArbitrageExecuted');
+        
+        if (arbitrageEvent && arbitrageEvent.args) {
+          const actualProfit = ethers.utils.formatEther(arbitrageEvent.args.profit);
+          const actualProfitUsd = strategy.baseToken.priceUsd 
+            ? (parseFloat(actualProfit) * strategy.baseToken.priceUsd).toFixed(2)
+            : 'unknown';
+            
+          logger.info(`Actual profit: ${actualProfit} ${strategy.baseToken.symbol} ($${actualProfitUsd})`);
+          
+          // Update stack knowledge with execution results
+          this.stackIntegrator.updateWithExecutionResults({
+            strategy,
+            success: true,
+            actualProfit: parseFloat(actualProfit),
+            executionTime: Date.now() - this.metrics.getOperationStartTime('arbitrageExecution') || 0,
+            gasUsed: receipt.gasUsed?.toString() || '0'
+          });
+          
+          // Update pair scores with actual result using reinforcement learning
+          const pairKey = `${strategy.baseToken.address}-${strategy.quoteToken.address}`;
+          this.updatePairScore(pairKey, true, parseFloat(actualProfit));
+          
+          // Emit execution event
+          this.emit('execution', {
+            strategy,
+            success: true,
+            profit: actualProfit
+          });
         }
 
         this.executionInProgress = false;
@@ -869,9 +1111,26 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       } else {
         // Transaction failed
         logger.error(`Arbitrage transaction failed`);
+        
+        // Learn from failure with Fi stack value-based analysis
+        this.stackIntegrator.updateWithExecutionResults({
+          strategy,
+          success: false,
+          failureReason: 'transaction_reverted',
+          executionTime: Date.now() - this.metrics.getOperationStartTime('arbitrageExecution') || 0,
+          gasUsed: receipt.gasUsed?.toString() || '0'
+        });
+        
         // Update pair scores with failure
-        const pairKey = `${validStrategy.baseToken.address}-${validStrategy.quoteToken.address}`;
+        const pairKey = `${strategy.baseToken.address}-${strategy.quoteToken.address}`;
         this.updatePairScore(pairKey, false);
+        
+        // Emit execution event
+        this.emit('execution', {
+          strategy,
+          success: false
+        });
+        
         this.executionInProgress = false;
         this.metrics.endOperation('arbitrageExecution', false);
         return false;
@@ -885,188 +1144,46 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   }
 
   /**
-   * Encode data for standard two-token arbitrage
+   * Get current network congestion level
+   * Returns a value between 0-1 where 0 is no congestion and 1 is maximum congestion
    */
-  private encodeStandardData(strategy: ArbitrageStrategy): string {
-    const path = [...strategy.path1, ...strategy.path2.slice(1)];
-    return AbiCoder.defaultAbiCoder.encode(
-      ['address[]', 'uint256'],
-      [path, strategy.minAmountOut]
-    );
-  }
-
-  /**
-   * Encode data for multi-hop arbitrage
-   */
-  private encodeMultiHopData(strategy: ArbitrageStrategy): string {
-    // Prepare route segments
-    const routes: any[] = [];
-    // Add path1 segments
-    for (let i = 0; i < strategy.path1.length - 1; i++) {
-      const from = strategy.path1[i];
-      const to = strategy.path1[i + 1];
-      // Get router for this segment
-      const router = i === 0 ? strategy.dex1 : this.dexService.getBestRouterForPair(from, to);
-      // Encode segment
-      const segment = {
-        dexType: this.getDexType(router),
-        path: [from, to],
-        router
-      };
-      routes.push(segment);
-    }
-
-    // Add path2 segments
-    for (let i = 0; i < strategy.path2.length - 1; i++) {
-      const from = strategy.path2[i];
-      const to = strategy.path2[i + 1];
-      // Get router for this segment
-      const router = i === 0 ? strategy.dex2 : this.dexService.getBestRouterForPair(from, to);
-      // Encode segment
-      const segment = {
-        dexType: this.getDexType(router),
-        path: [from, to],
-        router
-      };
-      routes.push(segment);
-    }
-
-    // Encode routes
-    const encodedRoutes = routes.map(route => {
-      if (route.dexType === 0) {
-        // Standard AMM
-        return AbiCoder.defaultAbiCoder.encode(
-          ['uint8', 'bytes'],
-          [
-            0,
-            AbiCoder.defaultAbiCoder.encode(
-              ['address', 'address[]'],
-              [route.router, route.path]
-            )
-          ]
-        );
-      } else if (route.dexType === 1) {
-        // Uniswap V3
-        const path = this.encodeUniswapV3Path(route.path);
-        return AbiCoder.defaultAbiCoder.encode(
-          ['uint8', 'bytes'],
-          [
-            1,
-            AbiCoder.defaultAbiCoder.encode(
-              ['bytes', 'uint256'],
-              [path, 0] // Min amount out will be checked at the end
-            )
-          ]
-        );
-      }
-      // Fallback to standard AMM
-      return AbiCoder.defaultAbiCoder.encode(
-        ['uint8', 'bytes'],
-        [
-          0,
-          AbiCoder.defaultAbiCoder.encode(
-            ['address', 'address[]'],
-            [route.router, route.path]
-          )
-        ]
-      );
-    });
-
-    // Encode full multi-hop data
-    return AbiCoder.defaultAbiCoder.encode(
-      ['bytes[]', 'uint256'],
-      [encodedRoutes, strategy.minAmountOut]
-    );
-  }
-
-  /**
-   * Encode path for Uniswap V3
-   */
-  private encodeUniswapV3Path(path: string[]): string {
-    if (path.length < 2) return '0x';
-    // For each hop, encode token addresses and fees
-    let encoded = '';
-    for (let i = 0; i < path.length - 1; i++) {
-      const tokenA = path[i];
-      const tokenB = path[i + 1];
-      // Get fee from config or use default
-      const fee = config.UNISWAP_V3_FEES[`${tokenA}-${tokenB}`] ||
-        config.UNISWAP_V3_FEES[`${tokenB}-${tokenA}`] ||
-        3000; // Default fee: 0.3%
-      if (i === 0) {
-        // First token
-        encoded += tokenA.slice(2).toLowerCase();
-      }
-      // Encode fee and next token
-      encoded += fee.toString(16).padStart(6, '0') + tokenB.slice(2).toLowerCase();
-    }
-    return '0x' + encoded;
-  }
-
-  /**
-   * Get DEX type for router
-   */
-  private getDexType(router: string): number {
-    if (router.toLowerCase() === config.UNISWAP_V3_ROUTER.toLowerCase()) {
-      return 1; // Uniswap V3
-    }
-    // Default to standard AMM
-    return 0;
-  }
-
-  /**
-   * Get USD value for token amount
-   */
-  private async getUsdValue(
-    amount: bigint,
-    tokenAddress: string
-  ): Promise<number> {
+  private async getNetworkCongestion(): Promise<number> {
     try {
-      // Get token price
-      const priceUsd = await this.priceOracle.getTokenPrice(tokenAddress);
-      // Get token decimals
-      const token = this.tokenService.getTokenByAddress(tokenAddress);
-      const decimals = token?.decimals || 18;
-      // Calculate USD value
-      const amountFormatted = parseFloat(formatUnits(amount, decimals));
-      return amountFormatted * priceUsd;
+      const [gasPrice, baseFee] = await Promise.all([
+        this.provider.getGasPrice(),
+        this.getBaseFee()
+      ]);
+      
+      // If base fee is available (EIP-1559), use it for congestion calculation
+      if (baseFee) {
+        const congestionFactor = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei')) / 
+                                parseFloat(ethers.utils.formatUnits(baseFee, 'gwei'));
+        return Math.min(Math.max((congestionFactor - 1) / 5, 0), 1);
+      }
+      
+      // Fallback method based on gas price relative to configured thresholds
+      const lowGasPrice = ethers.utils.parseUnits((config.LOW_GAS_PRICE || '30'), 'gwei');
+      const highGasPrice = ethers.utils.parseUnits((config.HIGH_GAS_PRICE || '100'), 'gwei');
+      
+      if (gasPrice.lte(lowGasPrice)) return 0;
+      if (gasPrice.gte(highGasPrice)) return 1;
+      
+      // Linear scale between low and high
+      return parseFloat(gasPrice.sub(lowGasPrice).mul(100).div(highGasPrice.sub(lowGasPrice)).toString()) / 100;
     } catch (error) {
-      logger.warn(`Error getting USD value: ${isError(error) ? error.message : String(error)}`);
-      return 0;
+      logger.warn('Failed to get network congestion, defaulting to medium (0.5)');
+      return 0.5;
     }
   }
 
   /**
-   * Error handling
+   * Get current base fee if available (EIP-1559)
    */
-  private handleError(operation: string, error: unknown): void {
-    const errorMessage = isError(error) ? error.message : String(error);
-    logger.error(`Error in ${operation}: ${errorMessage}`);
-    
-    if (isError(error) && error.stack) {
-      logger.debug(`Stack trace: ${error.stack}`);
+  private async getBaseFee(): Promise<ethers.BigNumber | null> {
+    try {
+      const block = await this.provider.getBlock('latest');
+      return block.baseFeePerGas || null;
+    } catch (error) {
+      return null;
     }
-    
-    this.emit('error', { operation, error });
   }
-
-  /**
-   * Get bot statistics
-   */
-  public getStatistics(): any {
-    return {
-      isRunning: this.isRunning,
-      totalDetections: this.metrics.getOperationCount('opportunityDetection'),
-      successfulDetections: this.metrics.getOperationSuccessCount('opportunityDetection'),
-      totalExecutions: this.metrics.getOperationCount('arbitrageExecution'),
-      successfulExecutions: this.metrics.getOperationSuccessCount('arbitrageExecution'),
-      averageDetectionTime: this.metrics.getAverageOperationTime('opportunityDetection'),
-      averageExecutionTime: this.metrics.getAverageOperationTime('arbitrageExecution'),
-      activePairs: this.pairScores.size,
-      topPairs: Array.from(this.pairScores.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10)
-        .map(([pair, score]) => ({ pair, score }))
-    };
-  }
-}
