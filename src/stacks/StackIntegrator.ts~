@@ -241,74 +241,76 @@ export class StackIntegrator {
   }
   
   /**
- * Analyzes arbitrage opportunity with quantum-optimized parameters
- */
-analyzeOpportunity(quotes: DEXQuotes): ArbitrageStrategy | { profitable: false } {
-  // Check if we have cached analysis
-  const cacheKey = `${quotes.pair}-${quotes.amountIn.toString()}`;
-  const cachedResult = this.opportunityCache.get(cacheKey);
-  
-  if (cachedResult && Date.now() - cachedResult.timestamp < this.cacheValidityPeriod) {
-    return cachedResult.data;
-  }
-  
-  // Apply Ti stack logical validation
-  if (!this.ti.validateLogic(quotes)) {
-    return { profitable: false };
-  }
-  
-  // Determine best execution path with Te stack
-  const {
-    swapPath,
-    dex1,
-    dex2,
-    profitable,
-    profitPercentage,
-    estimatedProfit,
-    optimalLoanAmount,
-    optimalPathScore
-  } = this.te.optimizeExchangePath(quotes);
-  
-  if (!profitable) {
+   * Analyzes arbitrage opportunity with quantum-optimized parameters
+   */
+  analyzeOpportunity(quotes: DEXQuotes): ArbitrageStrategy | { profitable: false } {
+    // Check if we have cached analysis
+    const cacheKey = `${quotes.pair}-${quotes.amountIn.toString()}`;f
+    const cachedResult = this.opportunityCache.get(cacheKey);
+    
+    if (cachedResult && Date.now() - cachedResult.timestamp < this.cacheValidityPeriod) {
+      return cachedResult.data;
+    }
+    
+    // Apply Ti stack logical validation
+    if (!this.ti.validateLogic(quotes)) {
+      return { profitable: false };
+    }
+    
+    // Determine best execution path with Te stack
+    const {
+      swapPath,
+      dex1,
+      dex2,
+      profitable,
+      profitPercentage,
+      estimatedProfit,
+      optimalLoanAmount,
+      optimalPathScore
+    } = this.te.optimizeExchangePath(quotes);
+    
+    if (!profitable) {
+      this.opportunityCache.set(cacheKey, {
+        timestamp: Date.now(),
+        data: { profitable: false }
+      });
+      return { profitable: false };
+    }
+    
+    // Create strategy with optimal parameters
+    // Fix ethers usage
+    const strategy: ArbitrageStrategy = {
+      pair: quotes.pair,
+      baseToken: quotes.baseToken,
+      quoteToken: quotes.quoteToken,
+      dex1,
+      dex2,
+      path1: swapPath[0],
+      path2: swapPath[1],
+      amountIn: quotes.amountIn,
+      flashLoanAmount: ethers.parseUnits(
+        optimalLoanAmount.toString(),
+        quotes.baseToken.decimals
+      ),
+      minAmountOut: quotes.amountIn.mul(
+        ethers.BigNumber.from(Math.floor(100 * (1 + profitPercentage * 0.8)))
+      ).div(ethers.BigNumber.from(105)),
+      estimatedProfit: ethers.BigNumber.from(Math.floor(estimatedProfit)),
+      profitPercentage,
+      profitUsd: 0, // Will be calculated later
+      optimalPathScore,
+      strategyHash: ethers.id(`${quotes.pair}-${dex1}-${dex2}-${Date.now()}`),
+      entropyFactor: quotes.entropyFactor
+    };
+    
+    // Cache the result
     this.opportunityCache.set(cacheKey, {
       timestamp: Date.now(),
-      data: { profitable: false }
+      data: strategy
     });
-    return { profitable: false };
+    
+    return strategy;
   }
-  
-  // Create strategy with optimal parameters
-  // Fix for ethers v6
-  const strategy: ArbitrageStrategy = {
-    pair: quotes.pair,
-    baseToken: quotes.baseToken,
-    quoteToken: quotes.quoteToken,
-    dex1,
-    dex2,
-    path1: swapPath[0],
-    path2: swapPath[1],
-    amountIn: quotes.amountIn,
-    flashLoanAmount: ethers.parseUnits(
-      optimalLoanAmount.toString(),
-      quotes.baseToken.decimals
-    ),
-    minAmountOut: quotes.amountIn * BigInt(Math.floor(100 * (1 + profitPercentage * 0.8))) / BigInt(105),
-    estimatedProfit: BigInt(Math.floor(estimatedProfit)),
-    profitPercentage,
-    profitUsd: 0, // Will be calculated later
-    optimalPathScore,
-    strategyHash: ethers.id(`${quotes.pair}-${dex1}-${dex2}-${Date.now()}`),
-    entropyFactor: quotes.entropyFactor
-  };
-  
-  // Cache the result
-  this.opportunityCache.set(cacheKey, {
-    timestamp: Date.now(),
-    data: strategy
-  });
-  
-  return strategy;
-}
   
   /**
    

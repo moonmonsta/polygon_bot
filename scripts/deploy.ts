@@ -1,60 +1,49 @@
-import hre from "hardhat";
-import * as fs from "fs";
-import * as path from "path";
+import { ethers } from "hardhat";
 
 async function main() {
   console.log("Deploying ArbitrageCore contract...");
 
-  const AAVE_ADDRESS_PROVIDER = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb";
-  const QUICKSWAP_ROUTER = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
-  const SUSHISWAP_ROUTER = "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506";
-
-  // Use ethers.parseEther for v6
-  const MIN_PROFIT_THRESHOLD = hre.ethers.parseEther("10");
-
-  // Deploy the contract
-  const ArbitrageCore = await hre.ethers.getContractFactory("ArbitrageCore");
+  // Get the contract factory
+  const ArbitrageCore = await ethers.getContractFactory("ArbitrageCore");
+  
+  // Constructor arguments from your contract:
+  // IPoolAddressesProvider _addressProvider,
+  // address _quickswapRouter,
+  // address _sushiswapRouter,
+  // address _uniswapV3Router,
+  // address _balancerVault,
+  // uint256 _minProfitThreshold,
+  // uint256 _maxGasPrice
+  
+  // Polygon network addresses (replace these with actual addresses for your network)
+  const aaveV3PoolAddressesProvider = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb"; // Polygon Aave V3
+  const quickswapRouter = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
+  const sushiswapRouter = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
+  const uniswapV3Router = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+  const balancerVault = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+  const minProfitThreshold = ethers.parseEther("0.1"); // 0.1 MATIC or other native token
+  const maxGasPrice = ethers.parseUnits("300", "gwei"); // 300 gwei max gas price
+  
+  // Deploy the contract with correct constructor arguments
   const arbitrageCore = await ArbitrageCore.deploy(
-    AAVE_ADDRESS_PROVIDER,
-    QUICKSWAP_ROUTER,
-    SUSHISWAP_ROUTER,
-    MIN_PROFIT_THRESHOLD
+    aaveV3PoolAddressesProvider,
+    quickswapRouter,
+    sushiswapRouter,
+    uniswapV3Router,
+    balancerVault,
+    minProfitThreshold,
+    maxGasPrice
   );
 
-  // Wait for the deployment transaction to be mined
   await arbitrageCore.waitForDeployment();
-
-  // Get the deployed contract address
-  const deployedAddress = await arbitrageCore.getAddress();
-  console.log(`Contract deployed at: ${deployedAddress}`);
-
-  // Update .env file with the deployed address
-  updateEnvFile('FLASH_LOAN_ADDRESS', deployedAddress);
-  console.log("Updated .env file with flash loan address");
-}
-
-function updateEnvFile(key: string, value: string): void {
-  const envFilePath = path.resolve('.env');
-  let envFileContent = '';
   
-  if (fs.existsSync(envFilePath)) {
-    envFileContent = fs.readFileSync(envFilePath, 'utf8');
-    const regex = new RegExp(`^${key}=.*$`, 'm');
-    if (regex.test(envFileContent)) {
-      envFileContent = envFileContent.replace(regex, `${key}=${value}`);
-    } else {
-      envFileContent += `\n${key}=${value}`;
-    }
-  } else {
-    envFileContent = `${key}=${value}`;
-  }
-
-  fs.writeFileSync(envFilePath, envFileContent.trim() + '\n');
+  const deployedAddress = await arbitrageCore.getAddress();
+  console.log(`ArbitrageCore deployed to: ${deployedAddress}`);
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+// We recommend this pattern to be able to use async/await everywhere
+// and properly handle errors.
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -1,19 +1,8 @@
 // src/bot/ArbitrageBot.ts
 
-import {
-  formatUnits,
-  parseUnits,
-  JsonRpcProvider,
-  WebSocketProvider,
-  Contract,
-  Wallet,
-  BigNumber,
-  AbiCoder,
-  isError
-} from "ethers";
-
+import { ethers } from "ethers";
 import { StackIntegrator } from '../stacks/StackIntegrator';
-import { PriceOracle } from '../utils/PriceOracle';
+import { getTokenPrice } from '../utils/PriceOracle';
 import { DEXQuotes, ArbitrageStrategy, TokenPair } from '../types/ArbitrageTypes';
 import { logger } from '../utils/Logger';
 import { config } from '../config/Config';
@@ -22,9 +11,27 @@ import { TokenService } from '../services/TokenService';
 import { DEXService } from '../services/DEXService';
 import { PerformanceMetrics } from '../utils/PerformanceMetrics';
 import { EventEmitter } from 'events';
-import { ArbitrageCoreABI } from '../abis/ArbitrageCoreABI';
-import { RouterABI } from '../abis/RouterABI';
-import { IERC20ABI } from '../abis/IERC20ABI';
+
+// Import ABIs - these should be in your project
+const ArbitrageCoreABI = [
+  "function executeArbitrage(address token, uint256 amount, bytes calldata data, bytes32 strategyHash) external returns (bool)",
+  "function updateStrategyScore(bytes32 strategyHash, uint256 score) external returns (bool)"
+];
+
+const RouterABI = [
+  "function getAmountsOut(uint amountIn, address[] memory path) external view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+];
+
+const IERC20ABI = [
+  "function balanceOf(address owner) external view returns (uint256)",
+  "function decimals() external view returns (uint8)",
+  "function symbol() external view returns (string)",
+  "function name() external view returns (string)",
+  "function transfer(address to, uint amount) external returns (bool)",
+  "function transferFrom(address from, address to, uint value) external returns (bool)",
+  "function approve(address spender, uint256 amount) external returns (bool)"
+];
 
 /**
  * Event types for ArbitrageBot
@@ -38,10 +45,10 @@ interface ArbitrageBotEvents {
 /**
  * Type for EventEmitter with strongly-typed events
  */
-type TypedEventEmitter<T> = Omit<EventEmitter, "on" | "emit"> & {
+interface TypedEventEmitter<T> extends Omit<EventEmitter, "on" | "emit"> {
   on<K extends keyof T>(event: K, listener: (arg: T[K]) => void): this;
   emit<K extends keyof T>(event: K, arg: T[K]): boolean;
-};
+}
 
 /**
  * Enhanced ArbitrageBot with quantum-inspired optimization
@@ -50,16 +57,15 @@ type TypedEventEmitter<T> = Omit<EventEmitter, "on" | "emit"> & {
 export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<ArbitrageBotEvents> {
   // Stacks and services
   private stackIntegrator: StackIntegrator;
-  private priceOracle: PriceOracle;
   private tokenService: TokenService;
   private dexService: DEXService;
   private metrics: PerformanceMetrics;
 
   // Blockchain connectivity
-  private provider: JsonRpcProvider;
+  private provider: ethers.Provider;
   private multicallProvider: MulticallProvider;
-  private wallet: Wallet;
-  private flashLoanContract: Contract;
+  private wallet: ethers.Wallet;
+  private flashLoanContract: ethers.Contract;
 
   // Runtime state
   private isRunning: boolean = false;
@@ -67,14 +73,13 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   private executionInProgress: boolean = false;
   private lastDetectionTime: number = 0;
   private detectionInterval: NodeJS.Timeout | null = null;
-  private blockSubscription: WebSocketProvider | null = null;
+  private blockSubscription: any = null;
 
   // Performance optimization
   private opportunityCache: Map<string, any> = new Map();
   private pathCache: Map<string, { timestamp: number; paths: string[][] }> = new Map();
   private pairScores: Map<string, number> = new Map();
   private cacheValidityPeriod = 30 * 1000; // 30 seconds
-  private explorationRatio = 0.1; // 10% of cycles are random for exploration
 
   // Configuration
   private readonly parallelismFactor = 3;
@@ -110,12 +115,12 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     };
 
     // Initialize connections
-    this.provider = new JsonRpcProvider(rpcUrl);
-    this.wallet = new Wallet(this.privateKey, this.provider);
+    this.provider = new ethers.JsonRpcProvider(rpcUrl);
+    this.wallet = new ethers.Wallet(this.privateKey, this.provider);
     this.multicallProvider = new MulticallProvider(this.provider);
 
     // Initialize contracts
-    this.flashLoanContract = new Contract(
+    this.flashLoanContract = new ethers.Contract(
       this.flashLoanAddress,
       ArbitrageCoreABI,
       this.wallet
@@ -124,18 +129,36 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     // Initialize core services
     this.tokenService = new TokenService(this.multicallProvider);
     this.dexService = new DEXService(this.multicallProvider, config);
-    this.priceOracle = new PriceOracle();
     this.metrics = new PerformanceMetrics();
 
     // Initialize quantum stack integration
     this.stackIntegrator = new StackIntegrator({
-      keystoneActivation: this.options.keystoneActivation,
-      tiDominantWeight: this.options.tiDominantWeight,
-      neDominantWeight: this.options.neDominantWeight,
-      entropy: this.options.entropy
+      keystoneActivation: this.options.keystoneActivation ?? true,
+      tiDominantWeight: this.options.tiDominantWeight ?? 0.85,
+      neDominantWeight: this.options.neDominantWeight ?? 0.72,
+      entropy: this.options.entropy ?? 0.96
     });
 
     logger.info('ArbitrageBot initialized with quantum-enhanced parameters');
+  }
+
+  /**
+   * Helper methods for ethers v6 compatibility
+   */
+  private formatUnits(value: bigint, unitName?: string | number): string {
+    return ethers.formatUnits(value, unitName || 'ether');
+  }
+
+  private parseUnits(value: string, unitName?: string | number): bigint {
+    return ethers.parseUnits(value, unitName || 'ether');
+  }
+
+  private getEthersUtils() {
+    // In v6, most utils are at the top level
+    return {
+      defaultAbiCoder: ethers.AbiCoder.defaultAbiCoder(),
+      id: ethers.id
+    };
   }
 
   /**
@@ -163,7 +186,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       this.emit('started');
     } catch (error) {
       this.isRunning = false;
-      const errorMessage = isError(error) ? error.message : String(error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       logger.error(`Failed to start ArbitrageBot: ${errorMessage}`);
       this.emit('error', {operation: 'start', error});
       throw error;
@@ -205,7 +228,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     // Initialize DEX routers with parallel loading
     const dexPromise = this.dexService.initializeDEXs();
     // Initialize price feeds
-    const pricePromise = this.priceOracle.initialize();
+    const pricePromise = Promise.resolve(); // Replaced PriceOracle with direct getTokenPrice function
     
     // Wait for all initializations to complete
     await Promise.all([tokensPromise, dexPromise, pricePromise]);
@@ -224,9 +247,9 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     }
 
     try {
-      const wsProvider = new WebSocketProvider(this.wsRpcUrl);
+      const wsProvider = new ethers.WebSocketProvider(this.wsRpcUrl);
       // Ensure connection is established
-      await wsProvider.waitForReady();
+      await wsProvider.getNetwork();
       
       wsProvider.on('block', async (blockNumber: number) => {
         if (this.shouldSkipDetection()) return;
@@ -240,7 +263,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       this.blockSubscription = wsProvider;
       logger.info('Block subscription established');
     } catch (error) {
-      logger.error(`Failed to setup WebSocket connection: ${isError(error) ? error.message : String(error)}`);
+      logger.error(`Failed to setup WebSocket connection: ${error instanceof Error ? error.message : String(error)}`);
       logger.info('Falling back to interval-based detection');
       this.setupIntervalDetection();
     }
@@ -472,13 +495,13 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       }
 
       // Randomize a portion of results to encourage exploration
-      const explorationCount = Math.floor(allCycles.length * this.explorationRatio);
+      const explorationRatio = 0.1;
+      const explorationCount = Math.floor(allCycles.length * explorationRatio);
       if (explorationCount > 0) {
         const explorationIndices = new Set<number>();
         while (explorationIndices.size < explorationCount) {
           explorationIndices.add(Math.floor(Math.random() * allCycles.length));
-        }
-
+    
         // Replace selected indices with random cycles
         for (const index of explorationIndices) {
           const cycleLength = allCycles[index].length;
@@ -613,12 +636,12 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
 
     return cycle;
   }
-
-  /**
+  
+ /**
    * Evaluate cycles for profit potential
    * Implements parallel processing with quantum-inspired optimization
    */
-  private async evaluateCycles(cycles: string[][], pairs: TokenPair[]): Promise<DEXQuotes[][]> {
+  private async evaluateCycles(cycles: string[][], pairs: TokenPair[]): Promise<Array<Array<DEXQuotes & { profitPercentage?: number }>>> {
     this.metrics.startOperation('cycleEvaluation');
     try {
       // Determine optimal batch size based on cycles length
@@ -626,7 +649,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         ? Math.min(Math.max(10, Math.floor(cycles.length / 20)), 50)
         : 20;
       logger.debug(`Evaluating ${cycles.length} cycles with batch size ${batchSize}`);
-      const profitableCycles: DEXQuotes[][] = [];
+      const profitableCycles: Array<Array<DEXQuotes & { profitPercentage?: number, from?: string, to?: string, amountOut?: bigint }>> = [];
       let processedCycles = 0;
       // Process in batches with parallelization
       for (let i = 0; i < cycles.length; i += batchSize) {
@@ -671,14 +694,14 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Evaluate a single cycle for arbitrage opportunity
    * Applies quantum Ti stack for precision and causal verification
    */
-  private async evaluateCycle(cycle: string[]): Promise<DEXQuotes[]> {
+  private async evaluateCycle(cycle: string[]): Promise<Array<DEXQuotes & { profitPercentage?: number, from?: string, to?: string, amountOut?: bigint }>> {
     try {
-      const quotes: DEXQuotes[] = [];
+      const quotes: Array<DEXQuotes & { profitPercentage?: number, from?: string, to?: string, amountOut?: bigint }> = [];
       // Test with multiple amounts for optimal sizing
       for (const amountInStr of config.TEST_AMOUNTS) {
-        const amountIn = BigInt(amountInStr);
+        const amountIn = BigInt(amountInStr.toString());
         let currentAmount = amountIn;
-        const cycleQuotes: DEXQuotes[] = [];
+        const cycleQuotes: Array<DEXQuotes & { profitPercentage?: number, from?: string, to?: string, amountOut?: bigint }> = [];
         let cycleBroken = false;
         // Evaluate each hop in the cycle
         for (let i = 0; i < cycle.length - 1; i++) {
@@ -692,10 +715,15 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
               break;
             }
 
+            // Update DEXQuotes type to match our structure
+            const dexQuote = quoteResult.bestQuote as DEXQuotes & { from?: string, to?: string, amountOut?: bigint };
+            dexQuote.from = from;
+            dexQuote.to = to;
+
             // Add to cycle quotes
-            cycleQuotes.push(quoteResult.bestQuote);
+            cycleQuotes.push(dexQuote);
             // Update current amount for next hop
-            currentAmount = quoteResult.bestQuote.amountOut;
+            currentAmount = dexQuote.amountOut || BigInt(0);
           } catch (error) {
             cycleBroken = true;
             break;
@@ -706,14 +734,15 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         if (!cycleBroken && cycleQuotes.length === cycle.length - 1) {
           // Calculate total profit
           const initialAmount = cycleQuotes[0].amountIn;
-          const finalAmount = cycleQuotes[cycleQuotes.length - 1].amountOut;
+          const finalAmount = cycleQuotes[cycleQuotes.length - 1].amountOut || BigInt(0);
+          
           if (finalAmount > initialAmount) {
             // Mark as profitable
             const profit = finalAmount - initialAmount;
-            const profitPercentage = Number(formatUnits(
-              (profit * BigInt(10000)) / initialAmount, 
-              4
-            ));
+            const profitPercentage = Number(
+              ethers.formatUnits((profit * BigInt(10000)) / initialAmount, 4)
+            );
+            
             // Add additional metadata
             cycleQuotes[0].profitPercentage = profitPercentage;
             cycleQuotes[0].entropyFactor = 0.95 + Math.random() * 0.05;
@@ -725,7 +754,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       // No profitable path found
       return [];
     } catch (error) {
-      logger.debug(`Error evaluating cycle: ${isError(error) ? error.message : String(error)}`);
+      logger.debug(`Error evaluating cycle: ${error instanceof Error ? error.message : String(error)}`);
       return [];
     }
   }
@@ -733,7 +762,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   /**
    * Check if a cycle is profitable above threshold
    */
-  private isCycleProfitable(quotes: DEXQuotes[]): boolean {
+  private isCycleProfitable(quotes: Array<DEXQuotes & { profitPercentage?: number }>): boolean {
     if (quotes.length === 0) return false;
     const profitPercentage = quotes[0].profitPercentage;
     if (profitPercentage === undefined) return false;
@@ -743,7 +772,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   /**
    * Log top arbitrage opportunities
    */
-  private logTopOpportunities(opportunities: DEXQuotes[][]): void {
+  private logTopOpportunities(opportunities: Array<Array<DEXQuotes & { profitPercentage?: number, from?: string, to?: string }>>): void {
     logger.info('Top arbitrage opportunities:');
     const topCount = Math.min(3, opportunities.length);
     for (let i = 0; i < topCount; i++) {
@@ -756,7 +785,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   /**
    * Format a path for logging
    */
-  private formatPath(quotes: DEXQuotes[]): string {
+  private formatPath(quotes: Array<DEXQuotes & { from?: string, to?: string }>): string {
     if (!Array.isArray(quotes) || quotes.length === 0) return "Empty path";
     const path = [this.tokenService.getTokenSymbol(quotes[0].from || '')];
     for (const quote of quotes) {
@@ -769,7 +798,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Execute arbitrage transaction
    * Uses quantum Te stack for implementation efficiency
    */
-  private async executeArbitrage(quotes: DEXQuotes): Promise<boolean> {
+  private async executeArbitrage(quotes: DEXQuotes & { profitPercentage?: number }): Promise<boolean> {
     if (this.executionInProgress) {
       logger.warn('Arbitrage execution already in progress, skipping');
       return false;
@@ -781,6 +810,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       logger.info(`Executing arbitrage: ${quotes.pair} with projected profit ${quotes.profitPercentage}%`);
       // Analyze opportunity with quantum stack
       const strategy = this.stackIntegrator.analyzeOpportunity(quotes);
+      
       if ('profitable' in strategy && !strategy.profitable) {
         logger.info('Opportunity no longer profitable after stack analysis');
         this.executionInProgress = false;
@@ -788,8 +818,8 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         return false;
       }
 
-      // Make TypeScript happy with a validated strategy
-      const validStrategy = strategy as Exclude<typeof strategy, { profitable: false }>;
+      // Type assertion to fix type issues - the stack analyzer returns a proper ArbitrageStrategy
+      const validStrategy = strategy as ArbitrageStrategy;
 
       // Get USD value of profit
       const profitUsd = await this.getUsdValue(validStrategy.estimatedProfit, validStrategy.baseToken.address);
@@ -823,7 +853,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       }
 
       // Execute the transaction with optimal gas parameters
-      logger.info(`Submitting transaction with gas price ${formatUnits(gasParams.gasPrice, 'gwei')} gwei, gas limit ${gasParams.gasLimit}`);
+      logger.info(`Submitting transaction with gas price ${ethers.formatUnits(gasParams.gasPrice, 'gwei')} gwei, gas limit ${gasParams.gasLimit}`);
       const tx = await this.flashLoanContract.executeArbitrage(
         validStrategy.baseToken.address,
         validStrategy.flashLoanAmount,
@@ -839,19 +869,24 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       // Wait for transaction confirmation
       const receipt = await tx.wait();
       // Process results
-      if (receipt?.status === 1) {
+      if (receipt && receipt.status === 1) {
         // Transaction successful
         logger.info(`Arbitrage executed successfully in block ${receipt.blockNumber}`);
         // Parse events to get actual profit
-        const eventData = receipt.logs?.find(
-          log => this.flashLoanContract.interface.parseLog(log)?.name === 'ArbitrageExecuted'
+        const arbitrageEvent = receipt.logs?.find(
+          (log: any) => log.topics[0] === ethers.id("ArbitrageExecuted(address,uint256,uint256)")
         );
         
-        if (eventData) {
-          const parsedLog = this.flashLoanContract.interface.parseLog(eventData);
-          if (parsedLog && parsedLog.args) {
-            const actualProfit = formatUnits(parsedLog.args.profit, validStrategy.baseToken.decimals);
-            logger.info(`Actual profit: ${actualProfit} ${validStrategy.baseToken.symbol} ($${(parseFloat(actualProfit) * validStrategy.baseToken.priceUsd).toFixed(2)})`);
+        if (arbitrageEvent) {
+          const iface = new ethers.Interface([
+            "event ArbitrageExecuted(address token, uint256 amount, uint256 profit)"
+          ]);
+          const eventData = iface.parseLog(arbitrageEvent);
+          
+          if (eventData && eventData.args) {
+            const actualProfit = ethers.formatUnits(eventData.args.profit, validStrategy.baseToken.decimals);
+            const priceUsd = validStrategy.baseToken.priceUsd || 0;
+            logger.info(`Actual profit: ${actualProfit} ${validStrategy.baseToken.symbol} ($${(parseFloat(actualProfit) * priceUsd).toFixed(2)})`);
             // Update pair scores with actual result
             const pairKey = `${validStrategy.baseToken.address}-${validStrategy.quoteToken.address}`;
             this.updatePairScore(pairKey, true, parseFloat(actualProfit));
@@ -859,7 +894,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
             await this.flashLoanContract.updateStrategyScore(
               validStrategy.strategyHash,
               Math.floor(validStrategy.optimalPathScore * 100)
-            ).catch(e => logger.warn(`Failed to update strategy score: ${isError(e) ? e.message : String(e)}`));
+            ).catch(e => logger.warn(`Failed to update strategy score: ${e.message}`));
           }
         }
 
@@ -889,7 +924,10 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    */
   private encodeStandardData(strategy: ArbitrageStrategy): string {
     const path = [...strategy.path1, ...strategy.path2.slice(1)];
-    return AbiCoder.defaultAbiCoder.encode(
+    
+    // Use updated ethers.js v6 encoding pattern
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+    return abiCoder.encode(
       ['address[]', 'uint256'],
       [path, strategy.minAmountOut]
     );
@@ -932,14 +970,15 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     }
 
     // Encode routes
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
     const encodedRoutes = routes.map(route => {
       if (route.dexType === 0) {
         // Standard AMM
-        return AbiCoder.defaultAbiCoder.encode(
+        return abiCoder.encode(
           ['uint8', 'bytes'],
           [
             0,
-            AbiCoder.defaultAbiCoder.encode(
+            abiCoder.encode(
               ['address', 'address[]'],
               [route.router, route.path]
             )
@@ -948,11 +987,11 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       } else if (route.dexType === 1) {
         // Uniswap V3
         const path = this.encodeUniswapV3Path(route.path);
-        return AbiCoder.defaultAbiCoder.encode(
+        return abiCoder.encode(
           ['uint8', 'bytes'],
           [
             1,
-            AbiCoder.defaultAbiCoder.encode(
+            abiCoder.encode(
               ['bytes', 'uint256'],
               [path, 0] // Min amount out will be checked at the end
             )
@@ -960,11 +999,11 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
         );
       }
       // Fallback to standard AMM
-      return AbiCoder.defaultAbiCoder.encode(
+      return abiCoder.encode(
         ['uint8', 'bytes'],
         [
           0,
-          AbiCoder.defaultAbiCoder.encode(
+          abiCoder.encode(
             ['address', 'address[]'],
             [route.router, route.path]
           )
@@ -973,7 +1012,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
     });
 
     // Encode full multi-hop data
-    return AbiCoder.defaultAbiCoder.encode(
+    return abiCoder.encode(
       ['bytes[]', 'uint256'],
       [encodedRoutes, strategy.minAmountOut]
     );
@@ -990,9 +1029,13 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
       const tokenA = path[i];
       const tokenB = path[i + 1];
       // Get fee from config or use default
-      const fee = config.UNISWAP_V3_FEES[`${tokenA}-${tokenB}`] ||
-        config.UNISWAP_V3_FEES[`${tokenB}-${tokenA}`] ||
-        3000; // Default fee: 0.3%
+      const feeKey = `${tokenA}-${tokenB}`;
+      const reverseFeeKey = `${tokenB}-${tokenA}`;
+      
+      // Handle the type issue by explicit null check
+      const fees = config.UNISWAP_V3_FEES as Record<string, number>;
+      const fee = fees[feeKey] || fees[reverseFeeKey] || 3000; // Default fee: 0.3%
+      
       if (i === 0) {
         // First token
         encoded += tokenA.slice(2).toLowerCase();
@@ -1007,7 +1050,7 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Get DEX type for router
    */
   private getDexType(router: string): number {
-    if (router.toLowerCase() === config.UNISWAP_V3_ROUTER.toLowerCase()) {
+    if (router.toLowerCase() === (config.UNISWAP_V3_ROUTER || '').toLowerCase()) {
       return 1; // Uniswap V3
     }
     // Default to standard AMM
@@ -1023,15 +1066,15 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
   ): Promise<number> {
     try {
       // Get token price
-      const priceUsd = await this.priceOracle.getTokenPrice(tokenAddress);
+      const priceUsd = await getTokenPrice(tokenAddress);
       // Get token decimals
       const token = this.tokenService.getTokenByAddress(tokenAddress);
       const decimals = token?.decimals || 18;
       // Calculate USD value
-      const amountFormatted = parseFloat(formatUnits(amount, decimals));
+      const amountFormatted = parseFloat(ethers.formatUnits(amount, decimals));
       return amountFormatted * priceUsd;
     } catch (error) {
-      logger.warn(`Error getting USD value: ${isError(error) ? error.message : String(error)}`);
+      logger.warn(`Error getting USD value: ${error instanceof Error ? error.message : String(error)}`);
       return 0;
     }
   }
@@ -1040,13 +1083,11 @@ export class ArbitrageBot extends EventEmitter implements TypedEventEmitter<Arbi
    * Error handling
    */
   private handleError(operation: string, error: unknown): void {
-    const errorMessage = isError(error) ? error.message : String(error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error(`Error in ${operation}: ${errorMessage}`);
-    
-    if (isError(error) && error.stack) {
+    if (error instanceof Error && error.stack) {
       logger.debug(`Stack trace: ${error.stack}`);
     }
-    
     this.emit('error', { operation, error });
   }
 
