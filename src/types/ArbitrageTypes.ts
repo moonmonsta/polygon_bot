@@ -1,29 +1,20 @@
-// src/types/ArbitrageTypes.ts (Update for BigNumber changes)
-import { ethers } from 'ethers';
+// src/types/ArbitrageTypes.ts
 
-export interface Token {
-  symbol: string;
-  address: string;
-  decimals: number;
-  priceUsd?: number;
-}
-
-export interface TokenPair {
-  name: string;
-  baseToken: string;
-  quoteToken: string;
-  volatility?: number;
-}
+import { Token } from './TokenTypes';
 
 export interface DEXQuotes {
   pair: string;
   baseToken: Token;
   quoteToken: Token;
-  amountIn: bigint; // Changed from ethers.BigNumber
-  quickswap: { forwardOut: bigint; reverseOut: bigint; }; // Changed
-  sushiswap: { forwardOut: bigint; reverseOut: bigint; }; // Changed
+  from: string;
+  to: string;
+  amountIn: bigint;
+  amountOut?: bigint;
+  quickswap: { forwardOut: bigint; reverseOut: bigint; };
+  sushiswap: { forwardOut: bigint; reverseOut: bigint; };
+  projectedProfit?: number;
+  profitPercentage?: number;
   entropyFactor: number;
-  projectedProfit?: number; 
 }
 
 export interface ArbitrageStrategy {
@@ -34,13 +25,47 @@ export interface ArbitrageStrategy {
   dex2: string;
   path1: string[];
   path2: string[];
-  amountIn: bigint; // Changed from ethers.BigNumber
-  flashLoanAmount: bigint; // Changed from ethers.BigNumber
-  minAmountOut: bigint; // Changed from ethers.BigNumber
-  estimatedProfit: bigint; // Changed from ethers.BigNumber
+  amountIn: bigint;
+  flashLoanAmount: bigint;
+  minAmountOut: bigint;
+  estimatedProfit: bigint;
   profitPercentage: number;
   profitUsd: number;
   optimalPathScore: number;
   strategyHash: string;
   entropyFactor: number;
+}
+
+export interface ArbitrageOptions {
+  minProfitPercentage: number;
+  minProfitUsd: number;
+  maxGasCostRatio: number;
+  slippageTolerance: number;
+  adaptiveBatchSize: boolean;
+  flashLoanProtocol: FlashLoanProtocol;
+}
+
+export enum FlashLoanProtocol {
+  AAVE = 'aave',
+  BALANCER = 'balancer',
+  CUSTOM = 'custom'
+}
+
+export interface ExecutionResult {
+  success: boolean;
+  txHash?: string;
+  profit?: string;
+  profitUsd?: number;
+  gasUsed?: bigint;
+  gasPrice?: bigint;
+  executionTimeMs?: number;
+  error?: string;
+}
+
+export interface ArbitrageDetectionStats {
+  totalDetections: number;
+  successfulDetections: number;
+  failedDetections: number;
+  averageDetectionTimeMs: number;
+  totalOpportunities: number;
 }

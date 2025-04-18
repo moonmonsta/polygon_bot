@@ -1,0 +1,249 @@
+// src/services/dex/UniswapV3Service.ts
+import { ethers } from 'ethers';
+import { logger } from '../../utils/Logger';
+import { DEXQuote, ExecuteSwapOptions, DEXType } from '../../types/DEXTypes';
+import { BaseDEXService } from './BaseDEXService';
+
+// ABIs
+const QUOTER_ABI = [
+  "function quoteExactInputSingle(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96) external returns (uint256 amountOut)",
+  "function quoteExactInput(bytes path, uint256 amountIn) external returns (uint256 amountOut)"
+];
+
+const ROUTER_ABI = [
+  "function exactInputSingle(tuple(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external returns (uint256 amountOut)",
+  "function exactInput(tuple(bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum)) external returns (uint256 amountOut)"
+];
+
+/**
+ * Service for interacting with Uniswap V3 DEX
+ */
+export class UniswapV3Service extends BaseDEXService {
+  private quoter: ethers.Contract;
+  private router: ethers.Contract;
+  private feeTiers: number[] = [100, 500, 3000, 10000]; // Default fee tiers: 0.01%, 0.05%, 0.3%, 1%
+  private feeCache: Map<string, number> = new Map(); // Cache for optimal fee tiers
+  
+  constructor(
+    provider: ethers.Provider,
+    private readonly routerAddress: string = '0xE592427A0AEce92De3Edee1F18E0157C05861564', // Default Uniswap V3 router
+    private readonly quoterAddress: string = '0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6' // Default Uniswap V3 quoter
+  ) {
+    super(provider, 'uniswap_v3', DEXType.UNISWAP_V3);
+    this.quoter = new ethers.Contract(this.quoterAddress, QUOTER_ABI, this.provider);
+    this.router = new ethers.Contract(this.routerAddress, ROUTER_ABI, this.provider);
+    logger.info(`UniswapV3Service initialized with router: ${this.routerAddress}, quoter: ${this.quoterAddress}`);
+  }
+  
+  /**
+   * Get quote for token swap
+   */
+  public async getQuote(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<DEXQuote> {
+    try {
+      // Find optimal fee tier
+      const fee = await this.getOptimalFeeTier(tokenIn, tokenOut, amountIn);
+      
+      // Get quote with optimal fee
+      const amountOut = await this.quoter.callStatic.quoteExactInputSingle(
+        tokenIn,
+        tokenOut,
+        fee,
+        amountIn,
+        0 // No price limit
+      );
+      
+      return {
+        dex: this.name,
+        path: [tokenIn, tokenOut],
+        amountIn,
+        amountOut,
+        gasEstimate: BigInt(180000) // Estimated gas for Uniswap V3 swap
+      };
+    } catch (error) {
+      logger.debug(`Error getting Uniswap V3 quote: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Uniswap V3 quote failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Get quotes for multiple token path
+   */
+  public async getQuoteForPath(path: string[], amountIn: bigint): Promise<DEXQuote> {
+    try {
+      if (path.length < 2) {
+        throw new Error('Path must contain at least 2 tokens');
+      }
+      
+      // For multi-hop paths, build the encoded path with fees
+      const encodedPath = await this.buildEncodedPath(path);
+      
+      // Get quote for encoded path
+      const amountOut = await this.quoter.callStatic.quoteExactInput(
+        encodedPath,
+        amountIn
+      );
+      
+      // Estimate gas based on path length
+      const baseGas = BigInt(150000);
+      const gasPerHop = BigInt(70000);
+      const gasEstimate = baseGas + gasPerHop * BigInt(path.length - 1);
+      
+      return {
+        dex: this.name,
+        path,
+        amountIn,
+        amountOut,
+        gasEstimate
+      };
+    } catch (error) {
+      logger.debug(`Error getting Uniswap V3 path quote: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Uniswap V3 path quote failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Find optimal fee tier for a token pair
+   */
+  private async getOptimalFeeTier(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<number> {
+    // Create cache key
+    const cacheKey = `${tokenIn.toLowerCase()}-${tokenOut.toLowerCase()}`;
+    
+    // Check cache
+    if (this.feeCache.has(cacheKey)) {
+      return this.feeCache.get(cacheKey)!;
+    }
+    
+    try {
+      let bestFee = 3000; // Default to 0.3%
+      let bestOutput = BigInt(0);
+      
+      // Try all fee tiers
+      for (const fee of this.feeTiers) {
+        try {
+          const amountOut = await this.quoter.callStatic.quoteExactInputSingle(
+            tokenIn,
+            tokenOut,
+            fee,
+            amountIn,
+            0 // No price limit
+          );
+          
+          if (amountOut > bestOutput) {
+            bestOutput = amountOut;
+            bestFee = fee;
+          }
+        } catch {
+          // This fee tier might not exist, continue to next
+          continue;
+        }
+      }
+      
+      // Cache the result
+      this.feeCache.set(cacheKey, bestFee);
+      
+      return bestFee;
+    } catch (error) {
+      logger.debug(`Error finding optimal fee tier: ${error instanceof Error ? error.message : String(error)}`);
+      return 3000; // Default to 0.3%
+    }
+  }
+  
+  /**
+   * Build encoded path for multi-hop swaps
+   */
+  private async buildEncodedPath(path: string[]): Promise<string> {
+    if (path.length < 2) {
+      throw new Error('Path must contain at least 2 tokens');
+    }
+    
+    let encoded = '0x';
+    
+    // For each hop, get optimal fee and encode
+    for (let i = 0; i < path.length - 1; i++) {
+      const tokenIn = path[i];
+      const tokenOut = path[i + 1];
+      
+      // Get optimal fee tier
+      const fee = await this.getOptimalFeeTier(tokenIn, tokenOut, BigInt(1000000)); // Use 1 unit as test amount
+      
+      // Encode the hop
+      // Format: tokenIn (20 bytes) + fee (3 bytes) + tokenOut (20 bytes) if there's another hop
+      // or just tokenIn (20 bytes) + fee (3 bytes) if it's the last hop
+      const tokenInEncoded = tokenIn.slice(2).toLowerCase(); // Remove 0x prefix
+      
+      if (i === 0) {
+        encoded += tokenInEncoded;
+      }
+      
+      // Add fee (3 bytes) and tokenOut
+      const feeHex = fee.toString(16).padStart(6, '0'); // 3 bytes = 6 hex chars
+      const tokenOutEncoded = tokenOut.slice(2).toLowerCase();
+      
+      encoded += feeHex + tokenOutEncoded;
+    }
+    
+    return encoded;
+  }
+  
+  /**
+   * Execute token swap
+   */
+  public async executeSwap(
+    path: string[],
+    amountIn: bigint,
+    options: ExecuteSwapOptions,
+    wallet: ethers.Wallet
+  ): Promise<ethers.TransactionResponse> {
+    try {
+      const connectedRouter = this.router.connect(wallet);
+      const recipient = options.recipient || wallet.address;
+      
+      // Get expected amount out
+      const quote = await this.getQuoteForPath(path, amountIn);
+      
+      // Calculate min amount out based on slippage
+      const minAmountOut = quote.amountOut * BigInt(10000 - options.slippageTolerance) / BigInt(10000);
+      
+      let tx;
+      
+      if (path.length === 2) {
+        // Simple swap (exactInputSingle)
+        const fee = await this.getOptimalFeeTier(path[0], path[1], amountIn);
+        
+        tx = await connectedRouter.exactInputSingle({
+          tokenIn: path[0],
+          tokenOut: path[1],
+          fee: fee,
+          recipient: recipient,
+          deadline: options.deadline,
+          amountIn: amountIn,
+          amountOutMinimum: minAmountOut,
+          sqrtPriceLimitX96: 0 // No price limit
+        }, {
+          gasLimit: options.gasLimit || 300000,
+          gasPrice: options.gasPriceGwei ? ethers.parseUnits(options.gasPriceGwei.toString(), 'gwei') : undefined
+        });
+      } else {
+        // Multi-hop swap (exactInput)
+        const encodedPath = await this.buildEncodedPath(path);
+        
+        tx = await connectedRouter.exactInput({
+          path: encodedPath,
+          recipient: recipient,
+          deadline: options.deadline,
+          amountIn: amountIn,
+          amountOutMinimum: minAmountOut
+        }, {
+          gasLimit: options.gasLimit || 350000,
+          gasPrice: options.gasPriceGwei ? ethers.parseUnits(options.gasPriceGwei.toString(), 'gwei') : undefined
+        });
+      }
+      
+      logger.info(`Uniswap V3 swap executed: ${tx.hash}`);
+      return tx;
+    } catch (error) {
+      logger.error(`Error executing Uniswap V3 swap: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Uniswap V3 swap failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}

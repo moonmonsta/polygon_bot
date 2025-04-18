@@ -29,13 +29,6 @@ export class DEXService {
     logger.info('DEXService initialized with multiple DEX providers');
   }
 
-  /**
-   * Initialize DEX services (can be used for async initialization tasks)
-   */
-  public async initialize(): Promise<void> {
-    logger.info('DEX services initialized');
-  }
-
   // Methods to interact with DEXs
   public getAllDEXs(): BaseDEXService[] {
     return Array.from(this.dexServices.values());

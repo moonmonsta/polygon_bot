@@ -1,5 +1,4 @@
 // src/index.ts
-
 import { ArbitrageBot } from './arbitrage/ArbitrageBot';
 import { logger } from './utils/Logger';
 import { config } from './config/Config';
@@ -10,13 +9,13 @@ dotenv.config();
 async function main() {
   try {
     // Load required environment variables
-    const {
-      FLASH_LOAN_ADDRESS,
-      PRIVATE_KEY,
-      RPC_URL,
-      WS_RPC_URL
+    const { 
+      FLASH_LOAN_ADDRESS, 
+      PRIVATE_KEY, 
+      RPC_URL, 
+      WS_RPC_URL 
     } = process.env;
-
+    
     // Validate required environment variables
     if (!FLASH_LOAN_ADDRESS) throw new Error('FLASH_LOAN_ADDRESS environment variable is not set');
     if (!PRIVATE_KEY) throw new Error('PRIVATE_KEY environment variable is not set');
@@ -24,9 +23,9 @@ async function main() {
 
     // Initialize and start the arbitrage bot
     const arbitrageBot = new ArbitrageBot(
-      FLASH_LOAN_ADDRESS,
-      PRIVATE_KEY,
-      RPC_URL,
+      FLASH_LOAN_ADDRESS, 
+      PRIVATE_KEY, 
+      RPC_URL, 
       WS_RPC_URL
     );
 
@@ -63,22 +62,24 @@ async function main() {
         process.exit(0);
       }, 1000);
     };
-
+    
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
-
+    
     logger.info('ArbitrageBot is running. Press CTRL+C to stop.');
 
     // Log statistics periodically
     setInterval(() => {
-      const stats = arbitrageBot.getStatistics();
+      const stats = arbitrageBot.getStatistics
       logger.info(`Statistics: ${JSON.stringify(stats, null, 2)}`);
-    }, 60000); // Log statistics every minute
-  } catch (error: any) {
-    logger.error(`Failed to start ArbitrageBot: ${error.message}`);
-    process.exit(1);
+    },
+    
   }
-}
+   // Log statistics periodically
+setInterval(() => {
+  const stats = arbitrageBot.getStatistics(); // Added parentheses to call the method
+  logger.info(`Statistics: ${JSON.stringify(stats, null, 2)}`);
+}, 60000); // Added interval parameter (60000ms = 1 minute)
 
 // Start the application
 main().catch(error => {

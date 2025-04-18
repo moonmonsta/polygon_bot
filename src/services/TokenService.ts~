@@ -1,0 +1,480 @@
+// src/services/TokenService.ts
+import { ethers } from "ethers";
+import { Token } from "../types/ArbitrageTypes";
+import { MulticallProvider } from "../utils/MulticallProvider";
+import { logger } from "../utils/Logger";
+// Define the IERC20 ABI directly since the import is missing
+const IERC20ABI = [
+  "function balanceOf(address account) external view returns (uint256)",
+  "function allowance(address owner, address spender) external view returns (uint256)",
+  "function approve(address spender, uint256 amount) external returns (bool)",
+  "function transfer(address recipient, uint256 amount) external returns (bool)",
+  "function transferFrom(address sender, address recipient, uint256 amount) external returns (bool)",
+  "function symbol() external view returns (string)",
+  "function decimals() external view returns (uint8)"
+];
+import { config } from "../config/Config";
+
+/**
+ * Enhanced TokenService with quantum-inspired optimization
+ * Manages token data and provides efficient token operations
+ */
+export class TokenService {
+  // Token data
+  private tokens: Map<string, Token> = new Map();
+  private tokensBySymbol: Map<string, Token> = new Map();
+  private tokensByAddress: Map<string, Token> = new Map();
+  
+  // Token categorization
+  private stablecoins: Set<string> = new Set();
+  private majorTokens: Set<string> = new Set();
+  private defiTokens: Set<string> = new Set();
+  private nftGameTokens: Set<string> = new Set();
+  
+  // Token weighting and liquidity
+  private tokenWeights: Map<string, number> = new Map();
+  private pairLiquidity: Map<string, number> = new Map();
+  
+  // Cache management
+  private decimalsCache: Map<string, number> = new Map();
+  private symbolCache: Map<string, string> = new Map();
+  private balanceCache: Map<string, { balance: bigint, timestamp: number }> = new Map();
+  private cacheValidityPeriod = 5 * 60 * 1000; // 5 minutes
+  
+  constructor(
+    private multicallProvider: MulticallProvider,
+    private provider: ethers.Provider
+  ) {
+    // Initialize token categories from config
+    this.initializeTokenCategories();
+  }
+  
+  /**
+   * Initialize token categories for optimized path finding
+   */
+  private initializeTokenCategories(): void {
+    // Stablecoins - high priority for arbitrage
+    config.STABLECOINS.forEach(address => this.stablecoins.add(address.toLowerCase()));
+    
+    // Major tokens - high liquidity
+    config.MAJOR_TOKENS.forEach(address => this.majorTokens.add(address.toLowerCase()));
+    
+    // DeFi tokens - medium priority
+    config.DEFI_TOKENS.forEach(address => this.defiTokens.add(address.toLowerCase()));
+    
+    // NFT/Game tokens - lower priority but potential opportunities
+    config.NFT_GAME_TOKENS.forEach(address => this.nftGameTokens.add(address.toLowerCase()));
+    
+    logger.info(`Initialized token categories: ${this.stablecoins.size} stablecoins, ${this.majorTokens.size} major tokens, ${this.defiTokens.size} DeFi tokens, ${this.nftGameTokens.size} NFT/Game tokens`);
+  }
+  
+  /**
+   * Load tokens with multicall for efficiency
+   */
+  public async loadTokens(tokenConfigs: any[]): Promise<void> {
+    logger.info(`Loading ${tokenConfigs.length} tokens`);
+    
+    // Define multicall batches
+    const batchSize = 50;
+    const batches: any[][] = [];
+    
+    for (let i = 0; i < tokenConfigs.length; i += batchSize) {
+      batches.push(tokenConfigs.slice(i, i + batchSize));
+    }
+    
+    // Process batches in parallel
+    for (const [batchIndex, batch] of batches.entries()) {
+      const calls = [];
+      
+      // Prepare calls for symbol and decimals
+      for (const tokenConfig of batch) {
+        // Skip if already loaded
+        if (this.tokensByAddress.has(tokenConfig.address.toLowerCase())) {
+          continue;
+        }
+        
+        // Use provider from multicallProvider to ensure compatibility
+        // Use provider instead of multicallProvider for contract interaction
+        const tokenContract = new ethers.Contract(tokenConfig.address, IERC20ABI, this.provider);
+        
+        // Add symbol call if not cached
+        if (!this.symbolCache.has(tokenConfig.address.toLowerCase())) {
+          calls.push(tokenContract.symbol());
+        }
+        
+        // Add decimals call if not cached
+        if (!this.decimalsCache.has(tokenConfig.address.toLowerCase())) {
+          calls.push(tokenContract.decimals());
+        }
+      }
+      
+      try {
+        // Execute multicall
+        const results = await Promise.allSettled(calls);
+        let resultIndex = 0;
+        
+        // Process results and create tokens
+        for (const tokenConfig of batch) {
+          const address = tokenConfig.address.toLowerCase();
+          
+          // Skip if already loaded
+          if (this.tokensByAddress.has(address)) {
+            continue;
+          }
+          
+          let symbol = tokenConfig.symbol;
+          let decimals = tokenConfig.decimals;
+          
+          // Get symbol from results or cache
+          if (!this.symbolCache.has(address)) {
+            const symbolResult = results[resultIndex++];
+            if (symbolResult.status === 'fulfilled') {
+              symbol = symbolResult.value;
+              this.symbolCache.set(address, symbol);
+            }
+          } else {
+            symbol = this.symbolCache.get(address)!;
+          }
+          
+          // Get decimals from results or cache
+          if (!this.decimalsCache.has(address)) {
+            const decimalsResult = results[resultIndex++];
+            if (decimalsResult.status === 'fulfilled') {
+              decimals = parseInt(decimalsResult.value);
+              this.decimalsCache.set(address, decimals);
+            }
+          } else {
+            decimals = this.decimalsCache.get(address)!;
+          }
+          
+          // Create token
+          const token: Token = {
+            address,
+            symbol,
+            decimals,
+            priceUsd: tokenConfig.priceUsd || 0,
+            category: this.getTokenCategory(address)
+          };
+          
+          // Store token in maps
+          this.tokens.set(address, token);
+          this.tokensBySymbol.set(symbol.toLowerCase(), token);
+          this.tokensByAddress.set(address, token);
+          
+          // Set token weight
+          this.tokenWeights.set(address, this.calculateTokenWeight(token));
+        }
+      } catch (error) {
+        logger.error(`Error loading token batch ${batchIndex}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    
+    logger.info(`Loaded ${this.tokens.size} tokens successfully`);
+  }
+  
+  /**
+   * Get token category for optimal path selection
+   */
+  private getTokenCategory(address: string): string {
+    address = address.toLowerCase();
+    
+    if (this.stablecoins.has(address)) return 'stablecoin';
+    if (this.majorTokens.has(address)) return 'major';
+    if (this.defiTokens.has(address)) return 'defi';
+    if (this.nftGameTokens.has(address)) return 'nft';
+    
+    return 'other';
+  }
+  
+  /**
+   * Calculate token weight for quantum-enhanced path selection
+   * Uses entropy-based weighting for optimal exploration
+   */
+  private calculateTokenWeight(token: Token): number {
+    const category = token.category || this.getTokenCategory(token.address);
+    
+    // Base weight by category
+    let weight = 0.5; // Default weight
+    
+    switch (category) {
+      case 'stablecoin':
+        weight = 0.9; // Highest priority
+        break;
+      case 'major':
+        weight = 0.8; // High priority
+        break;
+      case 'defi':
+        weight = 0.7; // Medium priority
+        break;
+      case 'nft':
+        weight = 0.6; // Lower priority
+        break;
+    }
+    
+    // Apply entropy modulation for exploration
+    const entropyFactor = 1 - (Math.random() * 0.1); // 0.9-1.0 range
+    weight *= entropyFactor;
+    
+    return weight;
+  }
+  
+  /**
+   * Preload common pairs for faster startup
+   */
+  public async preloadCommonPairs(pairs: any[]): Promise<void> {
+    logger.info(`Preloading liquidity data for ${pairs.length} common pairs`);
+    
+    const pairsToCheck = pairs.map(pair => ({
+      baseToken: pair.baseToken.toLowerCase(),
+      quoteToken: pair.quoteToken.toLowerCase()
+    }));
+    
+    // Execute in batches to avoid RPC overload
+    const batchSize = 20;
+    const batches = [];
+    
+    for (let i = 0; i < pairsToCheck.length; i += batchSize) {
+      batches.push(pairsToCheck.slice(i, i + batchSize));
+    }
+    
+    // Process batches in sequence to avoid rate limiting
+    for (const [batchIndex, batch] of batches.entries()) {
+      try {
+        const promises = batch.map(pair => this.checkPairLiquidity(pair.baseToken, pair.quoteToken));
+        await Promise.all(promises);
+        logger.debug(`Preloaded liquidity batch ${batchIndex + 1}/${batches.length}`);
+      } catch (error) {
+        logger.warn(`Error preloading liquidity batch ${batchIndex}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      
+      // Add small delay between batches
+      if (batchIndex < batches.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    logger.info(`Preloaded liquidity data for ${this.pairLiquidity.size} pairs`);
+  }
+  
+  /**
+   * Check if a token pair has liquidity
+   */
+  public async checkPairLiquidity(token0: string, token1: string): Promise<number> {
+    token0 = token0.toLowerCase();
+    token1 = token1.toLowerCase();
+    
+    // Create pair key (ordered by address)
+    const [baseToken, quoteToken] = token0 < token1 ? [token0, token1] : [token1, token0];
+    const pairKey = `${baseToken}-${quoteToken}`;
+    
+    // Check cache
+    if (this.pairLiquidity.has(pairKey)) {
+      return this.pairLiquidity.get(pairKey)!;
+    }
+    
+    try {
+      // Check for DEX configurations that include this pair
+      const liquidityScore = await this.estimatePairLiquidity(baseToken, quoteToken);
+      
+      // Store in cache
+      this.pairLiquidity.set(pairKey, liquidityScore);
+      
+      return liquidityScore;
+    } catch (error) {
+      logger.debug(`Error checking liquidity for pair ${pairKey}: ${error instanceof Error ? error.message : String(error)}`);
+      this.pairLiquidity.set(pairKey, 0);
+      return 0;
+    }
+  }
+  
+  /**
+   * Estimate pair liquidity using quantum principles
+   * Uses probabilistic assessment for efficient operation
+   */
+  private async estimatePairLiquidity(token0: string, token1: string): Promise<number> {
+    // Get token categories
+    const token0Category = this.getTokenByAddress(token0)?.category || this.getTokenCategory(token0);
+    const token1Category = this.getTokenByAddress(token1)?.category || this.getTokenCategory(token1);
+    
+    // Base liquidity score on token categories
+    let baseScore = 0.1; // Default low score
+    
+    // Pairs with stablecoins have high liquidity
+    if (token0Category === 'stablecoin' || token1Category === 'stablecoin') {
+      baseScore = 0.8;
+    }
+    
+    // Pairs with major tokens have good liquidity
+    else if (token0Category === 'major' || token1Category === 'major') {
+      baseScore = 0.7;
+    }
+    
+    // Pairs with DeFi tokens have medium liquidity
+    else if (token0Category === 'defi' || token1Category === 'defi') {
+      baseScore = 0.5;
+    }
+    
+    // Apply pair-specific boost for well-known pairs
+    const specialPairBoost = this.getSpecialPairBoost(token0, token1);
+    baseScore = Math.min(1, baseScore + specialPairBoost);
+    
+    // Apply entropy-based modulation for exploration
+    const entropyFactor = 0.95 + Math.random() * 0.1; // 0.95-1.05 range
+    const finalScore = baseScore * entropyFactor;
+    
+    return Math.min(1, Math.max(0, finalScore));
+  }
+  
+  /**
+   * Get special boost for well-known pairs
+   */
+  private getSpecialPairBoost(token0: string, token1: string): number {
+    // Check for specific high-liquidity pairs like WETH-USDC, WMATIC-USDC, etc.
+    const isWellKnown = config.HIGH_LIQUIDITY_PAIRS.some(pair => 
+      (pair.token0.toLowerCase() === token0 && pair.token1.toLowerCase() === token1) ||
+      (pair.token0.toLowerCase() === token1 && pair.token1.toLowerCase() === token0)
+    );
+    
+    return isWellKnown ? 0.2 : 0;
+  }
+  
+  /**
+   * Public API: Get token weight for path finding
+   */
+  public getTokenWeight(address: string): number {
+    address = address.toLowerCase();
+    return this.tokenWeights.get(address) || 0.5;
+  }
+  
+  /**
+   * Public API: Get token by address
+   */
+  public getTokenByAddress(address: string): Token | undefined {
+    return this.tokensByAddress.get(address.toLowerCase());
+  }
+  
+  /**
+   * Public API: Get token by symbol
+   */
+  public getTokenBySymbol(symbol: string): Token | undefined {
+    return this.tokensBySymbol.get(symbol.toLowerCase());
+  }
+  
+  /**
+   * Public API: Get token symbol
+   */
+  public getTokenSymbol(address: string): string {
+    const token = this.getTokenByAddress(address);
+    if (token) return token.symbol;
+    
+    // Check cache
+    const cachedSymbol = this.symbolCache.get(address.toLowerCase());
+    if (cachedSymbol) return cachedSymbol;
+    
+    // Return address substring as fallback
+    return address.substring(0, 6) + "...";
+  }
+  
+  /**
+   * Public API: Get token decimals
+   */
+  public async getTokenDecimals(address: string): Promise<number> {
+    const token = this.getTokenByAddress(address);
+    if (token) return token.decimals;
+    
+    // Check cache
+    const cachedDecimals = this.decimalsCache.get(address.toLowerCase());
+    if (cachedDecimals !== undefined) return cachedDecimals;
+    
+    // Fetch decimals
+    try {
+      // Use provider from multicallProvider to ensure compatibility
+      // Use provider instead of multicallProvider for contract interaction
+      const tokenContract = new ethers.Contract(address, IERC20ABI, this.provider);
+      const decimals = await tokenContract.decimals();
+      
+      // Cache result
+      this.decimalsCache.set(address.toLowerCase(), decimals);
+      
+      return decimals;
+    } catch (error) {
+      logger.warn(`Error getting decimals for token ${address}: ${error instanceof Error ? error.message : String(error)}`);
+      return 18; // Default to 18 decimals
+    }
+  }
+  
+  /**
+   * Check if a token is a stablecoin
+   */
+  public isStablecoin(address: string): boolean {
+    return this.stablecoins.has(address.toLowerCase());
+  }
+  
+  /**
+   * Check if a token is a major token
+   */
+  public isMajorToken(address: string): boolean {
+    return this.majorTokens.has(address.toLowerCase());
+  }
+  
+  /**
+   * Get all loaded tokens
+   */
+  public getAllTokens(): Token[] {
+    return Array.from(this.tokens.values());
+  }
+  
+  /**
+   * Get Pair Liquidity Score for UI and path finding
+   */
+  public getPairLiquidityScore(token0: string, token1: string): number {
+    token0 = token0.toLowerCase();
+    token1 = token1.toLowerCase();
+    
+    // Create pair key (ordered by address)
+    const [baseToken, quoteToken] = token0 < token1 ? [token0, token1] : [token1, token0];
+    const pairKey = `${baseToken}-${quoteToken}`;
+    
+    return this.pairLiquidity.get(pairKey) || 0;
+  }
+  
+  /**
+   * Check if a pair has liquidity based on threshold
+   */
+  public hasPairLiquidity(token0: string, token1: string): boolean {
+    const score = this.getPairLiquidityScore(token0, token1);
+    return score > 0.1; // Threshold for considering a pair to have liquidity
+  }
+  
+  /**
+   * Get token balance with caching
+   */
+  public async getTokenBalance(tokenAddress: string, walletAddress: string): Promise<bigint> {
+    const cacheKey = `${tokenAddress.toLowerCase()}-${walletAddress.toLowerCase()}`;
+    
+    // Check cache
+    const cachedBalance = this.balanceCache.get(cacheKey);
+    if (cachedBalance && Date.now() - cachedBalance.timestamp < this.cacheValidityPeriod) {
+      return cachedBalance.balance;
+    }
+    
+    try {
+      // Fetch balance
+      // Use provider from multicallProvider to ensure compatibility
+      // Use provider instead of multicallProvider for contract interaction
+      const tokenContract = new ethers.Contract(tokenAddress, IERC20ABI, this.provider);
+      const balance = await tokenContract.balanceOf(walletAddress);
+      
+      // Cache result
+      this.balanceCache.set(cacheKey, {
+        balance,
+        timestamp: Date.now()
+      });
+      
+      return balance;
+    } catch (error) {
+      logger.warn(`Error getting token balance: ${error instanceof Error ? error.message : String(error)}`);
+      return 0n; // Return BigInt 0 instead of BigNumber.from(0)
+    }
+  }
+}

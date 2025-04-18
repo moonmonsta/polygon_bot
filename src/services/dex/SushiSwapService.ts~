@@ -1,0 +1,174 @@
+// src/services/dex/SushiswapService.ts
+import { ethers } from 'ethers';
+import { logger } from '../../utils/Logger';
+import { DEXQuote, ExecuteSwapOptions, DEXType } from '../../types/DEXTypes';
+import { BaseDEXService } from './BaseDEXService';
+
+// ABIs
+const ROUTER_ABI = [
+  "function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
+  "function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)",
+  "function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+];
+
+/**
+ * Service for interacting with Sushiswap DEX
+ */
+export class SushiswapService extends BaseDEXService {
+  private router: ethers.Contract;
+  
+  constructor(
+    provider: ethers.Provider,
+    private readonly routerAddress: string = '0x1b02da8cb0d097eb8d57a175b88c7d8b47997506' // Default Sushiswap router on Polygon
+  ) {
+    super(provider, 'sushiswap', DEXType.STANDARD_AMM);
+    this.router = new ethers.Contract(this.routerAddress, ROUTER_ABI, this.provider);
+    logger.info(`SushiswapService initialized with router: ${this.routerAddress}`);
+  }
+  
+  /**
+   * Get quote for token swap
+   */
+  public async getQuote(tokenIn: string, tokenOut: string, amountIn: bigint): Promise<DEXQuote> {
+    try {
+      const path = [tokenIn, tokenOut];
+      const amounts = await this.router.getAmountsOut(amountIn, path);
+      const amountOut = amounts[amounts.length - 1];
+      
+      return {
+        dex: this.name,
+        path,
+        amountIn,
+        amountOut,
+        gasEstimate: BigInt(160000) // Estimated gas for standard swap on Sushiswap
+      };
+    } catch (error) {
+      logger.debug(`Error getting Sushiswap quote: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Sushiswap quote failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Get quotes for multiple token paths
+   */
+  public async getQuoteForPath(path: string[], amountIn: bigint): Promise<DEXQuote> {
+    try {
+      if (path.length < 2) {
+        throw new Error('Path must contain at least 2 tokens');
+      }
+      
+      const amounts = await this.router.getAmountsOut(amountIn, path);
+      const amountOut = amounts[amounts.length - 1];
+      
+      // Estimate gas based on path length
+      const baseGas = BigInt(120000);
+      const gasPerHop = BigInt(60000);
+      const gasEstimate = baseGas + gasPerHop * BigInt(path.length - 1);
+      
+      return {
+        dex: this.name,
+        path,
+        amountIn,
+        amountOut,
+        gasEstimate
+      };
+    } catch (error) {
+      logger.debug(`Error getting Sushiswap path quote: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Sushiswap path quote failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Execute token swap
+   */
+  public async executeSwap(
+    path: string[],
+    amountIn: bigint,
+    options: ExecuteSwapOptions,
+    wallet: ethers.Wallet
+  ): Promise<ethers.TransactionResponse> {
+    try {
+      const connectedRouter = this.router.connect(wallet);
+      
+      // Calculate min amount out based on slippage
+      const amounts = await this.router.getAmountsOut(amountIn, path);
+      const amountOut = amounts[amounts.length - 1];
+      const minAmountOut = amountOut * BigInt(10000 - options.slippageTolerance) / BigInt(10000);
+      
+      // Check if this is a ETH swap (first token is WETH)
+      const recipient = options.recipient || wallet.address;
+      const nativeTokenAddress = await this.getNativeTokenAddress();
+      
+      let tx;
+      if (path[0].toLowerCase() === nativeTokenAddress.toLowerCase()) {
+        // Swap ETH for tokens
+        tx = await connectedRouter.swapExactETHForTokens(
+          minAmountOut,
+          path.slice(1), // Remove WETH from path
+          recipient,
+          options.deadline,
+          {
+            value: amountIn,
+            gasLimit: options.gasLimit || 250000,
+            gasPrice: options.gasPriceGwei ? ethers.parseUnits(options.gasPriceGwei.toString(), 'gwei') : undefined
+          }
+        );
+      } else if (path[path.length - 1].toLowerCase() === nativeTokenAddress.toLowerCase()) {
+        // Swap tokens for ETH
+        tx = await connectedRouter.swapExactTokensForETH(
+          amountIn,
+          minAmountOut,
+          path.slice(0, -1), // Remove WETH from path
+          recipient,
+          options.deadline,
+          {
+            gasLimit: options.gasLimit || 250000,
+            gasPrice: options.gasPriceGwei ? ethers.parseUnits(options.gasPriceGwei.toString(), 'gwei') : undefined
+          }
+        );
+      } else {
+        // Standard token to token swap
+        tx = await connectedRouter.swapExactTokensForTokens(
+          amountIn,
+          minAmountOut,
+          path,
+          recipient,
+          options.deadline,
+          {
+            gasLimit: options.gasLimit || 200000,
+            gasPrice: options.gasPriceGwei ? ethers.parseUnits(options.gasPriceGwei.toString(), 'gwei') : undefined
+          }
+        );
+      }
+      
+      logger.info(`Sushiswap swap executed: ${tx.hash}`);
+      return tx;
+    } catch (error) {
+      logger.error(`Error executing Sushiswap swap: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Sushiswap swap failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Get the native token (WETH) address
+   */
+  private async getNativeTokenAddress(): Promise<string> {
+    // This would typically come from a config or be determined from the chain ID
+    const chainId = await this.provider.getNetwork().then(network => network.chainId);
+    
+    // Maps chain IDs to wrapped native token addresses
+    const nativeTokens: Record<number, string> = {
+      1: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // Ethereum - WETH
+      137: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', // Polygon - WMATIC
+      56: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', // BSC - WBNB
+      43114: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7' // Avalanche - WAVAX
+    };
+    
+    if (!nativeTokens[chainId]) {
+      throw new Error(`Native token address not defined for chain ID ${chainId}`);
+    }
+    
+    return nativeTokens[chainId];
+  }
+}

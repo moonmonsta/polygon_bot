@@ -1,0 +1,52 @@
+// src/types/DEXTypes.ts
+import { Token } from './TokenTypes';
+
+export interface DEXQuote {
+  dex: string;
+  path: string[];
+  amountIn: bigint;
+  amountOut: bigint;
+  gasEstimate: bigint;
+}
+
+export interface LiquidityPool {
+  address: string;
+  dex: string;
+  token0: string;
+  token1: string;
+  reserve0: bigint;
+  reserve1: bigint;
+  fee?: number;
+}
+
+export interface DEXConfig {
+  name: string;
+  routerAddress: string;
+  factoryAddress: string;
+  quoterAddress?: string;
+  type: DEXType;
+  defaultFee?: number;
+  feeTiers?: number[];
+}
+
+export enum DEXType {
+  STANDARD_AMM = 'standard_amm',
+  UNISWAP_V3 = 'uniswap_v3',
+  CURVE = 'curve',
+  BALANCER = 'balancer'
+}
+
+export interface PathFindingOptions {
+  maxHops: number;
+  maxPaths: number;
+  prioritizeByLiquidity: boolean;
+  timeout: number;
+}
+
+export interface ExecuteSwapOptions {
+  slippageTolerance: number;
+  deadline: number;
+  gasLimit?: number;
+  gasPriceGwei?: number;
+  recipient?: string;
+}

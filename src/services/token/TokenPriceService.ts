@@ -1,0 +1,211 @@
+// src/services/token/TokenPriceService.ts
+
+import { ethers } from 'ethers';
+import { logger } from '../../utils/Logger';
+import { TokenPrice } from '../../types/TokenTypes';
+import axios from 'axios';
+
+/**
+ * Service for fetching token prices from various sources
+ */
+export class TokenPriceService {
+  private priceCache: Map<string, TokenPrice> = new Map();
+  private cacheValidityPeriod: number = 60 * 1000; // 1 minute
+  private apiKeys: Record<string, string> = {};
+
+  constructor(
+    private provider: ethers.Provider,
+    private readonly chainId: number = 137, // Default to Polygon
+    apiKeys: Record<string, string> = {}
+  ) {
+    this.apiKeys = apiKeys;
+    logger.info(`TokenPriceService initialized for chain ${chainId}`);
+  }
+
+  /**
+   * Get token price in USD
+   */
+  public async getTokenPrice(tokenAddress: string): Promise<number> {
+    tokenAddress = tokenAddress.toLowerCase();
+    // Check cache
+    const cachedPrice = this.priceCache.get(tokenAddress);
+    if (cachedPrice && Date.now() - cachedPrice.timestamp < this.cacheValidityPeriod) {
+      return cachedPrice.priceUsd;
+    }
+
+    try {
+      // Try multiple sources in parallel for better reliability
+      const [coingeckoPrice, defiLlamaPrice] = await Promise.allSettled([
+        this.getPriceFromCoingecko(tokenAddress),
+        this.getPriceFromDefiLlama(tokenAddress)
+      ]);
+
+      let price: number = 0;
+      let source: string = '';
+
+      // Process results in priority order
+      if (coingeckoPrice.status === 'fulfilled' && coingeckoPrice.value > 0) {
+        price = coingeckoPrice.value;
+        source = 'coingecko';
+      } else if (defiLlamaPrice.status === 'fulfilled' && defiLlamaPrice.value > 0) {
+        price = defiLlamaPrice.value;
+        source = 'defillama';
+      } else {
+        // Fallback to checking for well-known stablecoins
+        price = this.getStablecoinPrice(tokenAddress);
+        source = 'hardcoded';
+      }
+
+      // Cache the result
+      if (price > 0) {
+        this.priceCache.set(tokenAddress, {
+          address: tokenAddress,
+          priceUsd: price,
+          timestamp: Date.now(),
+          source
+        });
+        return price;
+      }
+
+      throw new Error('Price not available from any source');
+    } catch (error) {
+      logger.warn(`Error getting price for ${tokenAddress}: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Get prices for multiple tokens
+   */
+  public async getTokenPrices(tokenAddresses: string[]): Promise<Record<string, number>> {
+    const uniqueAddresses = [...new Set(tokenAddresses.map(addr => addr.toLowerCase()))];
+    const results: Record<string, number> = {};
+    // Get prices in parallel
+    const pricePromises = uniqueAddresses.map(async (address) => {
+      try {
+        const price = await this.getTokenPrice(address);
+        results[address] = price;
+      } catch {
+        results[address] = 0;
+      }
+    });
+    await Promise.all(pricePromises);
+    return results;
+  }
+
+  /**
+   * Get price from CoinGecko
+   */
+  private async getPriceFromCoingecko(tokenAddress: string): Promise<number> {
+    try {
+      // Map chain ID to CoinGecko platform
+      const platformId = this.getCoingeckoPlatformId(this.chainId);
+      if (!platformId) {
+        throw new Error(`Unsupported chain ID for Coingecko: ${this.chainId}`);
+      }
+
+      // Use API key if available
+      const apiKeyParam = this.apiKeys.coingecko ? `&x_cg_pro_api_key=${this.apiKeys.coingecko}` : '';
+      const response = await axios.get(
+        `https://api.coingecko.com/api/v3/simple/token_price/${platformId}?contract_addresses=${tokenAddress}&vs_currencies=usd${apiKeyParam}`,
+        { timeout: 5000 }
+      );
+      if (response.data && response.data[tokenAddress]) {
+        return response.data[tokenAddress].usd;
+      }
+      return 0;
+    } catch (error) {
+      logger.debug(`Coingecko price error for ${tokenAddress}: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Get price from DeFi Llama
+   */
+  private async getPriceFromDefiLlama(tokenAddress: string): Promise<number> {
+    try {
+      // Get chain name from chain ID
+      const chainName = this.getDeFiLlamaChainName(this.chainId);
+      if (!chainName) {
+        throw new Error(`Unsupported chain ID for DeFi Llama: ${this.chainId}`);
+      }
+
+      const response = await axios.get(
+        `https://coins.llama.fi/prices/current/${chainName}:${tokenAddress}`,
+        { timeout: 5000 }
+      );
+      const coinKey = `${chainName}:${tokenAddress}`;
+      if (response.data && response.data.coins && response.data.coins[coinKey]) {
+        return response.data.coins[coinKey].price;
+      }
+      return 0;
+    } catch (error) {
+      logger.debug(`DeFi Llama price error for ${tokenAddress}: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Get hardcoded price for well-known stablecoins
+   */
+  private getStablecoinPrice(tokenAddress: string): number {
+    const stablecoins: Record<string, number> = {
+      // Polygon stablecoins
+      '0x2791bca1f2de4661ed88a30c99a7a9449aa84174': 1, // USDC
+      '0xc2132d05d31c914a87c6611c10748aeb04b58e8f': 1, // USDT
+      '0x8f3cf7ad23cd3cabd9735aff958023239c6a063': 1, // DAI
+      '0x45c32fa6df82ead1e2ef74d17b76547eddfaff89': 1, // FRAX
+      '0xdab529f40e671a1d4bf91361c21bf9f0c9712ab7': 1, // BUSD
+      '0x2e1ad108ff1d8c782fcbbb89aad783ac49586756': 1, // TUSD
+      '0xa3fa99a148fa48d14ed51d610c367c61876997f1': 1 // MAI
+    };
+    return stablecoins[tokenAddress.toLowerCase()] || 0;
+  }
+
+  /**
+   * Get CoinGecko platform ID from chain ID
+   */
+  private getCoingeckoPlatformId(chainId: number): string | null {
+    const platforms: Record<number, string> = {
+      1: 'ethereum',
+      137: 'polygon-pos',
+      56: 'binance-smart-chain',
+      43114: 'avalanche',
+      42161: 'arbitrum-one',
+      10: 'optimistic-ethereum'
+    };
+    return platforms[chainId] || null;
+  }
+
+  /**
+   * Get DeFi Llama chain name from chain ID
+   */
+  private getDeFiLlamaChainName(chainId: number): string | null {
+    const chains: Record<number, string> = {
+      1: 'ethereum',
+      137: 'polygon',
+      56: 'bsc',
+      43114: 'avax',
+      42161: 'arbitrum',
+      10: 'optimism'
+    };
+    return chains[chainId] || null;
+  }
+
+  /**
+   * Clear price cache
+   */
+  public clearCache(): void {
+    this.priceCache.clear();
+    logger.debug('Token price cache cleared');
+  }
+
+  /**
+   * Update cache validity period
+   */
+  public setCacheValidityPeriod(periodMs: number): void {
+    this.cacheValidityPeriod = periodMs;
+    logger.debug(`Token price cache validity period set to ${periodMs}ms`);
+  }
+}

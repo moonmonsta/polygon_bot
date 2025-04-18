@@ -1,0 +1,287 @@
+// src/services/execution/FlashLoanService.ts
+import { ethers } from 'ethers';
+import { logger } from '../../utils/Logger';
+import { FlashLoanProtocol, ArbitrageStrategy } from '../../types/ArbitrageTypes';
+
+// ABIs
+const AAVE_LENDING_POOL_ABI = [
+  "function flashLoan(address receiverAddress, address[] calldata assets, uint256[] calldata amounts, uint256[] calldata modes, address onBehalfOf, bytes calldata params, uint16 referralCode) external returns (bool)"
+];
+
+const BALANCER_VAULT_ABI = [
+  "function flashLoan(address recipient, address[] tokens, uint256[] amounts, bytes calldata userData) external"
+];
+
+const ARBITRAGE_EXECUTOR_ABI = [
+  "function executeFlashLoan(address[] calldata tokens, uint256[] calldata amounts, uint256[] calldata modes, bytes calldata params)",
+  "function executeBalancerFlashLoan(address[] calldata tokens, uint256[] calldata amounts, bytes calldata userData)"
+];
+
+/**
+ * Service for executing flash loan operations
+ */
+export class FlashLoanService {
+  // Protocol contracts
+  private aaveLendingPool?: ethers.Contract;
+  private balancerVault?: ethers.Contract;
+  
+  // Custom executor contract
+  private arbitrageExecutor?: ethers.Contract;
+  
+  constructor(
+    private provider: ethers.Provider,
+    private wallet: ethers.Wallet,
+    private protocol: FlashLoanProtocol = FlashLoanProtocol.AAVE,
+    private executorAddress?: string,
+    private aaveLendingPoolAddress?: string,
+    private balancerVaultAddress?: string
+  ) {
+    // Initialize contracts based on provided addresses
+    this.initializeContracts();
+    logger.info(`FlashLoanService initialized with protocol: ${protocol}`);
+  }
+  
+  /**
+   * Initialize protocol contracts
+   */
+  private initializeContracts(): void {
+    // Initialize executor contract if address provided
+    if (this.executorAddress) {
+      this.arbitrageExecutor = new ethers.Contract(
+        this.executorAddress,
+        ARBITRAGE_EXECUTOR_ABI,
+        this.wallet
+      );
+    }
+    
+    // Initialize protocol-specific contracts
+    if (this.protocol === FlashLoanProtocol.AAVE && this.aaveLendingPoolAddress) {
+      this.aaveLendingPool = new ethers.Contract(
+        this.aaveLendingPoolAddress,
+        AAVE_LENDING_POOL_ABI,
+        this.wallet
+      );
+    } else if (this.protocol === FlashLoanProtocol.BALANCER && this.balancerVaultAddress) {
+      this.balancerVault = new ethers.Contract(
+        this.balancerVaultAddress,
+        BALANCER_VAULT_ABI,
+        this.wallet
+      );
+    }
+  }
+  
+  /**
+   * Execute a flash loan for arbitrage
+   */
+  public async executeFlashLoan(
+    strategy: ArbitrageStrategy,
+    encodedParams: string
+  ): Promise<ethers.TransactionResponse> {
+    // Validate strategy
+    this.validateStrategy(strategy);
+    
+    // Execute flash loan based on protocol
+    switch (this.protocol) {
+      case FlashLoanProtocol.AAVE:
+        return this.executeAaveFlashLoan(strategy, encodedParams);
+      case FlashLoanProtocol.BALANCER:
+        return this.executeBalancerFlashLoan(strategy, encodedParams);
+      case FlashLoanProtocol.CUSTOM:
+        return this.executeCustomFlashLoan(strategy, encodedParams);
+      default:
+        throw new Error(`Unsupported flash loan protocol: ${this.protocol}`);
+    }
+  }
+  
+  /**
+   * Validate arbitrage strategy
+   */
+  private validateStrategy(strategy: ArbitrageStrategy): void {
+    if (!strategy.baseToken || !strategy.baseToken.address) {
+      throw new Error('Strategy missing base token information');
+    }
+    
+    if (!strategy.flashLoanAmount || strategy.flashLoanAmount <= BigInt(0)) {
+      throw new Error('Invalid flash loan amount');
+    }
+    
+    if (!strategy.path1 || !strategy.path2 || strategy.path1.length < 2 || strategy.path2.length < 2) {
+      throw new Error('Invalid arbitrage paths');
+    }
+  }
+  
+  /**
+   * Execute flash loan using Aave
+   */
+  private async executeAaveFlashLoan(
+    strategy: ArbitrageStrategy,
+    encodedParams: string
+  ): Promise<ethers.TransactionResponse> {
+    if (!this.aaveLendingPool && !this.arbitrageExecutor) {
+      throw new Error('Aave lending pool and executor not initialized');
+    }
+    
+    try {
+      // Prepare flash loan parameters
+      const tokens = [strategy.baseToken.address];
+      const amounts = [strategy.flashLoanAmount];
+      const modes = [0]; // 0 = no debt (pay back the loan within the transaction)
+      const onBehalfOf = this.wallet.address;
+      const referralCode = 0;
+      
+      let tx;
+      
+      // Execute directly or through custom executor
+      if (this.arbitrageExecutor) {
+        // Execute through custom executor
+        tx = await this.arbitrageExecutor.executeFlashLoan(
+          tokens,
+          amounts,
+          modes,
+          encodedParams,
+          {
+            gasLimit: 2000000,
+          }
+        );
+      } else if (this.aaveLendingPool) {
+        // Execute directly through Aave
+        tx = await this.aaveLendingPool.flashLoan(
+          this.wallet.address, // receiver
+          tokens,
+          amounts,
+          modes,
+          onBehalfOf,
+          encodedParams,
+          referralCode,
+          {
+            gasLimit: 2000000,
+          }
+        );
+      } else {
+        throw new Error('No available contract to execute flash loan');
+      }
+      
+      logger.info(`Aave flash loan executed: ${tx.hash}`);
+      return tx;
+    } catch (error) {
+      logger.error(`Error executing Aave flash loan: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Aave flash loan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Execute flash loan using Balancer
+   */
+  private async executeBalancerFlashLoan(
+    strategy: ArbitrageStrategy,
+    encodedParams: string
+  ): Promise<ethers.TransactionResponse> {
+    if (!this.balancerVault && !this.arbitrageExecutor) {
+      throw new Error('Balancer vault and executor not initialized');
+    }
+    
+    try {
+      // Prepare flash loan parameters
+      const tokens = [strategy.baseToken.address];
+      const amounts = [strategy.flashLoanAmount];
+      
+      let tx;
+      
+      // Execute directly or through custom executor
+      if (this.arbitrageExecutor) {
+        // Execute through custom executor
+        tx = await this.arbitrageExecutor.executeBalancerFlashLoan(
+          tokens,
+          amounts,
+          encodedParams,
+          {
+            gasLimit: 2000000,
+          }
+        );
+      } else if (this.balancerVault) {
+        // Execute directly through Balancer
+        tx = await this.balancerVault.flashLoan(
+          this.wallet.address, // recipient
+          tokens,
+          amounts,
+          encodedParams,
+          {
+            gasLimit: 2000000,
+          }
+        );
+      } else {
+        throw new Error('No available contract to execute flash loan');
+      }
+      
+      logger.info(`Balancer flash loan executed: ${tx.hash}`);
+      return tx;
+    } catch (error) {
+      logger.error(`Error executing Balancer flash loan: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Balancer flash loan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Execute flash loan using custom protocol
+   */
+  private async executeCustomFlashLoan(
+    strategy: ArbitrageStrategy,
+    encodedParams: string
+  ): Promise<ethers.TransactionResponse> {
+    if (!this.arbitrageExecutor) {
+      throw new Error('Custom executor not initialized');
+    }
+    
+    try {
+      // Execute through custom executor
+      // This assumes a custom function on the executor contract
+      const tx = await this.arbitrageExecutor.executeArbitrage(
+        strategy.baseToken.address,
+        strategy.flashLoanAmount,
+        encodedParams,
+        strategy.strategyHash,
+        {
+          gasLimit: 2000000,
+        }
+      );
+      
+      logger.info(`Custom flash loan executed: ${tx.hash}`);
+      return tx;
+    } catch (error) {
+      logger.error(`Error executing custom flash loan: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Custom flash loan failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  /**
+   * Encode arbitrage parameters
+   */
+  public encodeArbitrageParams(strategy: ArbitrageStrategy): string {
+    // Combine paths and encode with min amount out
+    const fullPath = [...strategy.path1];
+    
+    // Add path2 elements (skipping the first one to avoid duplication)
+    for (let i = 1; i < strategy.path2.length; i++) {
+      if (!fullPath.includes(strategy.path2[i])) {
+        fullPath.push(strategy.path2[i]);
+      }
+    }
+    
+    // Add deadline (5 minutes from now)
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    
+    // Encode parameters
+    return ethers.AbiCoder.defaultAbiCoder.encode(
+      ['address[]', 'uint256', 'uint256', 'bytes32'],
+      [fullPath, strategy.minAmountOut, deadline, strategy.strategyHash]
+    );
+  }
+  
+  /**
+   * Set flash loan protocol
+   */
+  public setProtocol(protocol: FlashLoanProtocol): void {
+    this.protocol = protocol;
+    logger.info(`Flash loan protocol set to ${protocol}`);
+  }
+}
